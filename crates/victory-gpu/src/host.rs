@@ -7493,6 +7493,71 @@ static SPLIT: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::A
 /// in them (all threads), and the big flushes' wall nanoseconds.
 pub(crate) static NOTHING_NEW: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
+/// Up to how many refreshes a flush looks at which copy nothing on the
+/// submitting thread, before it wakes any other; more go to the threads,
+/// look and all (`VICTORY_FRONT_FEW`, 256).
+fn front_few() -> usize {
+    static FEW: OnceLock<usize> = OnceLock::new();
+    *FEW.get_or_init(|| std::env::var("VICTORY_FRONT_FEW").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(256))
+}
+
+/// Of a big flush's refreshes, those that may copy something: the looks at
+/// which copy nothing made on the threads beside this one, 64 to a piece of
+/// work, each piece under one reading of the journal
+/// (`crate::watch::journal_view`). Taken once per look, from up to seven
+/// threads at once, the journal's lock was most of a look's time: 8.0 of
+/// 9.4 ms a frame of all threads' for 10,000 looks (run look). And how many
+/// were told to copy nothing.
+fn looks_apart(spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>) -> (Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>, usize) {
+    const PIECE: usize = 64;
+    let n = spans.len();
+    let spans = std::sync::Arc::new(spans);
+    let same: std::sync::Arc<Vec<std::sync::atomic::AtomicBool>> = std::sync::Arc::new((0..n).map(|_| std::sync::atomic::AtomicBool::new(false)).collect());
+    {
+        let (spans, same) = (spans.clone(), same.clone());
+        crate::shadow::wide_each(n.div_ceil(PIECE), move |piece| {
+            let began = std::time::Instant::now();
+            let j = crate::watch::journal_view();
+            let (from, to) = (piece * PIECE, ((piece + 1) * PIECE).min(spans.len()));
+            for i in from..to {
+                let (shadow, at, end) = &spans[i];
+                if shadow.nothing_new_in(&j, *at, *end - *at) {
+                    same[i].store(true, Ordering::Relaxed);
+                }
+            }
+            drop(j);
+            NOTHING_NEW[0].fetch_add((to - from) as u64, Ordering::Relaxed);
+            NOTHING_NEW[1].fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        });
+    }
+    let spans = std::sync::Arc::try_unwrap(spans).unwrap_or_else(|a| (*a).clone());
+    let mut told = 0;
+    let rest = spans
+        .into_iter()
+        .zip(same.iter())
+        .filter_map(|(span, same)| {
+            if same.load(Ordering::Relaxed) {
+                told += 1;
+                None
+            } else {
+                Some(span)
+            }
+        })
+        .collect();
+    (rest, told)
+}
+
+/// Whether a big flush's looks are made apart, in pieces ([`looks_apart`];
+/// `VICTORY_LOOKS_APART=1`, off by default). Run apart: the looks 1.2 ms a
+/// frame from first to last against 7.2 (4.6 ms of all threads' time
+/// against 10.9), but the frame no shorter (60.1 ms against 58.5): the
+/// submitting thread's refreshes are the copies that do copy and the
+/// textures, and the pass apart is one more waking of the threads.
+fn looks_apart_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LOOKS_APART").is_some_and(|v| v == "1"))
+}
+
 /// `Shadow::nothing_new` on a thread of a big flush, timed ([`NOTHING_NEW`]).
 fn timed_nothing_new(shadow: &crate::shadow::Shadow, from: usize, to: usize) -> bool {
     let began = std::time::Instant::now();
@@ -7537,6 +7602,11 @@ fn split_line(frames: f64) {
         tracing::info!(
             "refreshes of big flushes per frame: {:.0} looks known to copy nothing taking {:.2} ms (all threads), the big flushes {:.2} ms from first to last",
             n[0], n[1] / 1e6, n[2] / 1e6
+        );
+        let l: Vec<f64> = crate::shadow::LOOK_NS.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        tracing::info!(
+            "looks whether a refresh copies nothing per frame: {:.0}, over {:.0} pages; {:.2} ms the pending ranges, {:.2} ms the copy's notes, {:.2} ms the journal",
+            l[3], l[4], l[0] / 1e6, l[1] / 1e6, l[2] / 1e6
         );
     }
     let ms: Vec<f64> = SPLIT.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames).collect();
@@ -8032,9 +8102,19 @@ impl Batch {
         let before = [0, 2].map(|i| PREPARING[i].load(Ordering::Relaxed));
         // Those known to copy nothing are said so here, unless they are very
         // many: then beside the others.
-        const FEW: usize = 256;
+        let FEW: usize = front_few();
         let mut spans = spans;
-        let many = spans.len() > FEW;
+        let mut many = spans.len() > FEW;
+        if many && looks_apart_on() {
+            let wall = std::time::Instant::now();
+            let (rest, told) = looks_apart(spans);
+            spans = rest;
+            many = false;
+            NOTHING_NEW[2].fetch_add(wall.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            FLUSHES[2].fetch_add(told as u64, Ordering::Relaxed);
+            let _ = told;
+        }
         if !many {
             #[cfg(feature = "diagnostics")]
             let all = spans.len();
@@ -8194,7 +8274,7 @@ impl Batch {
         // from what the submission's asking found, before anything is asked
         // and any thread woken. (Thousands of them, the heap's buffer views
         // once a frame: on the threads, below.)
-        const FEW: usize = 256;
+        let FEW: usize = front_few();
         let light = crate::watch::light();
         if light && self.refreshes.len() <= FEW {
             let started = std::time::Instant::now();
@@ -8204,6 +8284,15 @@ impl Batch {
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);
+        }
+        if light && self.refreshes.len() > FEW && looks_apart_on() {
+            let wall = std::time::Instant::now();
+            let (rest, told) = looks_apart(std::mem::take(&mut self.refreshes));
+            self.refreshes = rest;
+            NOTHING_NEW[2].fetch_add(wall.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            FLUSHES[2].fetch_add(told as u64, Ordering::Relaxed);
+            let _ = told;
         }
         // One write-watch asking for the copies that lie close together,
         // not one per copy.

@@ -274,3 +274,23 @@ later, frame times settle by 130 s), one pair per change.
   refreshes stayed at 15.4 ms, nearly all of it 9,400 refreshes a frame finding nothing
   new, which only it can find at its submission; and the lists' threads took 11.6 ms a
   frame longer to say a list was translated. Taken out again.
+- **The looks that copy nothing, made cheaper; the frame no shorter.** 9,100-10,000 a
+  frame, about 1 us each alone as with others (all of them on the submitting thread,
+  `VICTORY_FRONT_FEW=1000000`: refreshes 17.7 ms against 17.2). Timed in parts (run
+  look): 0.64 ms the copy's pending ranges, 0.74 ms its notes, 8.0 ms the journal,
+  for 12 pages a look: the journal's lock taken 10,000 times a frame by up to seven
+  threads. The journal's ranges asked ahead are kept sorted and joined, looked up by
+  halving (they were gone through one by one at every look; no change in time alone).
+  With the looks of a big flush made apart, 64 to a piece under one reading of the
+  journal, the copy's own locks only tried (`VICTORY_LOOKS_APART=1`, off): the looks
+  1.2 ms from first to last against 7.2, 4.6 ms of all threads' time against 10.9 -
+  and the frame 60.1 ms against 58.5, the refreshes 16.7 against 15.4. The submitting
+  thread's refreshes are the 1,100 copies a frame that do copy and the textures.
+- **belobug/victory-belobug-amd** (shares 0a435665 with this tree; 169 commits since on
+  `a-publier`): renderer port 6 (`VICTORY_PORT_GUARD=1`: the guards' lock shared by
+  faults and refreshes, the looks and the planning of a submission's refreshes beside
+  the submitting thread) cherry-picked onto a local branch: 60.8 ms against 60.3, not
+  taken. Port 7 (the heaps' records asked at the title's submit, the journal in 64
+  parts) needs their ports 1-5 (`port`, `port_cbv`, `port_descriptors`) and was not
+  brought. Also there, not tried: textures uploaded in a submission's prelude
+  (5d6bd84, flicker), the light stand-in settling by time (9576c45), FSR 4 (AMD).

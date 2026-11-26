@@ -3734,7 +3734,9 @@ impl Shadow {
     /// Whether [`Shadow::update`] of `[address, address + len)` would copy
     /// nothing, and knows it without asking anything
     /// (`crate::watch::nothing_new`). `false` if it would have to ask.
-    pub(crate) fn nothing_new(&self, address: usize, len: usize) -> bool {
+    /// [`Shadow::nothing_new`] with the journal already read
+    /// ([`crate::watch::journal_view`]), for many looks in a row.
+    pub(crate) fn nothing_new_in(&self, j: &crate::watch::JournalView, address: usize, len: usize) -> bool {
         if self.place.is_some() {
             return true;
         }
@@ -3746,12 +3748,55 @@ impl Shadow {
         if !matches!(self.watched.load(Ordering::Relaxed), 1 | GUARDED) {
             return false;
         }
+        // Only tried, the journal held: elsewhere these are taken before
+        // it, and a look that cannot have them says it cannot tell.
+        let Ok(pending) = self.pending.try_lock() else { return false };
+        if pending.iter().any(|&(a, e)| a < to && e > from) {
+            return false;
+        }
+        drop(pending);
+        let Ok(copied) = self.copied.try_lock() else { return false };
+        let Ok(ranged) = self.ranged.try_lock() else { return false };
+        let ranged = ranged.iter().filter(|r| r.0 <= from && to <= r.1).map(|r| r.2).max().unwrap_or(0);
+        let same = crate::watch::nothing_new_in(j, from, to, start / PAGE, &copied, ranged);
+        #[cfg(feature = "diagnostics")]
+        if same {
+            use crate::copystat::{C, add};
+            add(C::Checked, (to - from) as u64);
+            add(C::Unchanged, (to - from) as u64);
+        }
+        same
+    }
+
+    pub(crate) fn nothing_new(&self, address: usize, len: usize) -> bool {
+        // (Timed in parts: LOOK_NS.)
+        if self.place.is_some() {
+            return true;
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), (address + len).min(end));
+        if from >= to {
+            return true;
+        }
+        if !matches!(self.watched.load(Ordering::Relaxed), 1 | GUARDED) {
+            return false;
+        }
+        let t0 = std::time::Instant::now();
         // Around ranges shaders are writing the refresh asks gap by gap.
         if self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from) {
             return false;
         }
+        let t1 = std::time::Instant::now();
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let same = crate::watch::nothing_new(from, to, start / PAGE, &copied, self.ranged(from, to));
+        let ranged = self.ranged(from, to);
+        let t2 = std::time::Instant::now();
+        let same = crate::watch::nothing_new(from, to, start / PAGE, &copied, ranged);
+        let t3 = std::time::Instant::now();
+        LOOK_NS[0].fetch_add((t1 - t0).as_nanos() as u64, Ordering::Relaxed);
+        LOOK_NS[1].fetch_add((t2 - t1).as_nanos() as u64, Ordering::Relaxed);
+        LOOK_NS[2].fetch_add((t3 - t2).as_nanos() as u64, Ordering::Relaxed);
+        LOOK_NS[3].fetch_add(1, Ordering::Relaxed);
+        LOOK_NS[4].fetch_add(((to - from) / PAGE) as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         if same {
             use crate::copystat::{C, add};
@@ -5607,3 +5652,8 @@ pub(crate) fn near(va: u64) -> String {
     }
     text
 }
+
+/// Diagnostics, since the last frame line: nanoseconds of [`Shadow::nothing_new`]
+/// in its parts (the pending ranges' lock, the copy's notes and its ranged
+/// note, the journal's look), the looks, and the pages they covered.
+pub(crate) static LOOK_NS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];

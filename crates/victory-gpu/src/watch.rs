@@ -306,6 +306,29 @@ const AHEAD_GAP: usize = (8 << 20) / PAGE;
 /// The most one asking covers (its answer needs 8 bytes per 4 KiB page).
 const AHEAD_MAX: usize = (1 << 30) / PAGE;
 
+/// `ranges` (pages, first and past the last) sorted and joined where they
+/// meet or overlap, for [`ahead_holds`].
+fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    ranges.sort_unstable();
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (a, b) in ranges {
+        match out.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(b),
+            _ => out.push((a, b)),
+        }
+    }
+    out
+}
+
+/// Whether the pages `[first, last)` lie in one of `ranges`, sorted and
+/// joined ([`joined`]). The journal's ranges asked ahead were looked through
+/// one by one at every refresh: thousands of refreshes a submission, and
+/// hundreds of ranges (about 1 us a look in run few, alone as with others).
+fn ahead_holds(ranges: &[(usize, usize)], first: usize, last: usize) -> bool {
+    let at = ranges.partition_point(|r| r.0 <= first);
+    at > 0 && last <= ranges[at - 1].1
+}
+
 /// Asks the kernel about many ranges `(start, end)` at once, before the
 /// [`writes`] of each: ranges close together are one asking, and `writes`
 /// then answers from the journal until [`ask_ahead_done`]. The world's
@@ -349,7 +372,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     note_hot(&written);
     let mut j = journal_mut();
     j.ahead_asked = next_asking();
-    j.ahead = asked;
+    j.ahead = joined(asked);
     let now = j.ahead_asked;
     for (page, parts) in written {
         j.note(page, parts, now);
@@ -540,10 +563,11 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
 /// asking stands.
 fn ask_rest(ranges: &[(usize, usize)]) {
     let _all = Asking::hold_all();
-    let mut ahead = {
+    let base = {
         let mut j = journal_mut();
         std::mem::take(&mut j.ahead)
     };
+    let mut ahead: Vec<(usize, usize)> = Vec::new();
     // `ask_ahead` leaves a range that lies alone to `writes`, which asks
     // once per flush: with one asking for the submission that was every
     // such range asked again at each of its 70 flushes (run 76: 2,300
@@ -555,7 +579,8 @@ fn ask_rest(ranges: &[(usize, usize)]) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !ahead.iter().any(|&(a, b)| a <= first && last <= b)
+        if !ahead_holds(&base, first, last)
+            && !ahead.iter().any(|&(a, b)| a <= first && last <= b)
             && let Some(pages) = kernel_written(first, last)
         {
             written.extend(pages);
@@ -573,8 +598,9 @@ fn ask_rest(ranges: &[(usize, usize)]) {
     for (page, parts) in written {
         j.note(page, parts, now);
     }
+    ahead.extend(base);
     j.kept = !ahead.is_empty();
-    j.ahead = ahead;
+    j.ahead = joined(ahead);
 }
 
 /// The submission's one asking stands no longer: its refreshes are done,
@@ -647,10 +673,7 @@ fn ask_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: 
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = journal();
-    j.ahead
-        .iter()
-        .any(|&(a, b)| a <= first && last <= b)
-        .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
+    ahead_holds(&j.ahead, first, last).then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
 }
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
@@ -662,7 +685,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let of = |j: &Journal| -> Vec<(usize, u64)> { j.written.range(first..last).map(|(&p, &w)| (p, w)).collect() };
     // Asked ahead with the submission's other ranges: the journal has it.
-    let ahead = |j: &Journal| j.ahead.iter().any(|&(a, b)| a <= first && last <= b).then(|| (j.ahead_asked, of(j)));
+    let ahead = |j: &Journal| ahead_holds(&j.ahead, first, last).then(|| (j.ahead_asked, of(j)));
     if let Some(known) = ahead(&journal()) {
         return Some(known);
     }
@@ -738,6 +761,22 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 /// asked: the submission's asking covers the range, or its blocks are known
 /// by their bits. `false` if something would have to be asked.
 pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64], ranged: u64) -> bool {
+    nothing_new_in(&JournalView(journal()), start, end, base, copied, ranged)
+}
+
+/// The journal, read: for many looks ([`nothing_new_in`]) under one taking
+/// of its lock. Taken some 10,000 times a frame, once per look, from up to
+/// seven threads, the lock was most of a look's time (8.0 of 9.4 ms a frame
+/// in run look: 0.8 us a look of 12 pages).
+pub(crate) struct JournalView(std::sync::RwLockReadGuard<'static, Journal>);
+
+pub(crate) fn journal_view() -> JournalView {
+    JournalView(journal())
+}
+
+/// [`nothing_new`] with the journal already read.
+pub(crate) fn nothing_new_in(j: &JournalView, start: usize, end: usize, base: usize, copied: &[u64], ranged: u64) -> bool {
+    let j = &j.0;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     // The bits first, then the journal, as in `writes`.
     let known = published(start, end);
@@ -745,8 +784,7 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
     if known {
         crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
     }
-    let j = journal();
-    if !known && !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+    if !known && !ahead_holds(&j.ahead, first, last) {
         return false;
     }
     let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
@@ -4495,5 +4533,27 @@ mod many_askers_tests {
         BITS.clear(511);
         assert!(!BITS.all(300, 700) && BITS.all(300, 511) && BITS.all(512, 700));
         assert!(!BITS.all(1 << 40, (1 << 40) + 1), "outside the address space");
+    }
+}
+
+#[cfg(test)]
+mod ahead_tests {
+    use super::{ahead_holds, joined};
+
+    #[test]
+    fn joined_ranges_answer_as_the_list_did() {
+        let ranges = vec![(50, 60), (10, 20), (20, 25), (40, 45), (44, 52), (70, 70), (100, 200)];
+        let j = joined(ranges.clone());
+        assert_eq!(j, vec![(10, 25), (40, 60), (70, 70), (100, 200)]);
+        for first in 0..210 {
+            for last in first..210 {
+                let one = ranges.iter().any(|&(a, b)| a <= first && last <= b);
+                // Joined, a range across two that meet is held too (both were asked).
+                let any_union = j.iter().any(|&(a, b)| a <= first && last <= b);
+                assert_eq!(ahead_holds(&j, first, last), any_union, "{first}..{last}");
+                assert!(!one || ahead_holds(&j, first, last), "{first}..{last}");
+            }
+        }
+        assert!(!ahead_holds(&[], 1, 2));
     }
 }

@@ -16,7 +16,11 @@ param(
     [string]$Tag = "",
     # Logical processors the game may run on, as a bit mask (0: all). On a
     # Ryzen with two core dies, 0xFFF keeps it on the first die's 12 threads.
-    [long]$Affinity = 0
+    [long]$Affinity = 0,
+    # Settings on top of the ones below, as NAME=value (VICTORY_ is added if
+    # missing): -Set VICTORY_DISPLAY_MODE=1920x1080,GPU_TIMING=1. Variables set
+    # outside the script do not reach the game: every VICTORY_ one is cleared.
+    [string[]]$Set = @()
 )
 $ErrorActionPreference = 'Stop'
 # Once per PowerShell session (several runs from one window).
@@ -60,6 +64,13 @@ $settings = @{
 }
 if ($SkipMenus) {
     $settings.VICTORY_KEYS = (15, 25, 35, 45, 55, 70, 90, 110, 130, 150, 170, 190 | ForEach-Object { "${_}:Enter" }) -join ','
+}
+foreach ($pair in $Set) {
+    $k, $v = $pair -split '=', 2
+    if ($null -eq $v) { throw "-Set wants NAME=value, not '$pair'" }
+    if ($k -notlike 'VICTORY_*') { $k = "VICTORY_$k" }
+    $settings[$k] = $v
+    Write-Host "Set:   $k=$v"
 }
 Get-ChildItem Env:VICTORY_* | ForEach-Object { Remove-Item "Env:$($_.Name)" }
 New-Item -ItemType Directory -Force $Cache, $Data | Out-Null

@@ -121,3 +121,53 @@ Also tried in this round, each one run: heap-sync rounds every 1 ms instead of 4
 Ray tracing does not run: without `VICTORY_BVH_BUILDER=1` every stage of the structure
 builder is dropped and the ray resolve and activation passes are left out; there is no
 ray-tracing work of the card's to take away.
+
+## Later on 2026-11-26: where the frame stands, and what did not move it
+
+After a restart the unchanged build gives 58.2-59.4 ms (about 17 fps) in eight runs.
+The host's card-clock line explains why CPU cuts elsewhere did nothing: the card is
+about 64 % busy and idle **21 ms a frame behind the submitting thread**, which worked
+55.9 ms of each 58 ms frame. Its parts (the `preparing per frame` line): the lists' steps
+23.5 ms (refreshes of host copies 16.1, of 10,500 refreshes 9,400 known to copy
+nothing), copies in the card's memory 10.6, the write watch 5.5, planning the card's
+steps 4.8, title bytes under flights' writes 3.5. Across threads the guards cost 12 ms
+of waiting and 6.4 ms of protection changes a frame.
+
+Measured this round, two runs a side, taking turns:
+
+| Change | Mean frame | Against |
+|---|---|---|
+| The console told it is on a 1080p set (`VICTORY_DISPLAY_MODE=1920x1080`) | 59.1 ms | 59.0 ms: the title renders its fixed Series S size |
+| Release build (no `diagnostics`) | 58.6 ms | 58.9 ms: the counters cost nothing that shows |
+| Guards rest 16 ms instead of 3 (`VICTORY_GUARD_REST=16000`) | 62.4 ms | 58.4 ms: worse |
+
+`scripts/play-guarded.ps1` clears every `VICTORY_` variable before it starts the game,
+so a variable set in the shell never reaches it: pass settings with
+`-Set NAME=value,...` (added now).
+
+## Rendering
+
+- **Dropped draws.** Of the 840 dispatches a frame dropped "without a host pipeline",
+  836 are the ray-tracing structure builder and its resolve and ray activation, left out
+  on purpose with ray tracing off (the log called the last two "being made"; it now
+  names them). One a frame is a real loss: `CS_DefragHeap_ComputeRelocations`, a
+  64-lane program (a wave walking a list of blocks lane by lane, `v_readlane` of lane
+  63, `v_mbcnt` over the 64 lanes) that has no 32-lane form yet on a card with 32-lane
+  waves only. The title's GPU heap is not defragmented. Three more 64-lane programs
+  (`CS_TransmissionVolumetrics_Tiled*`, `CS_CollectTriangles_Meshlets`) do not
+  translate either but did not run in the opening.
+- **Textures.** The frame line's "25,000 waiting" are mostly slots not due yet: the
+  queue's census has about 1,000 due at a time (the oldest written 8 frames before) and
+  106 waiting for memory. Leaving the largest level of large textures out to make room
+  was tried; with `VICTORY_LEVELS_ON_DEMAND=0` (which the held-levels path needs) the
+  device was lost 40 s in, and it is not kept.
+- **Bands in the light the ambient stand-in gives.** With `VICTORY_AMBIENT` on (the
+  launcher's 0.8) every surface it lights showed bands, each step about 1.2 times the
+  next: the dark interior in rings around the window, and the sky and ground seen through
+  the window's glass in steps of 5-10 of 255. With the stand-in off the sky is smooth
+  (steps of 1-2) and the room black. The light it writes has 9-bit mantissas; the
+  bands come from the title keeping it coarsely further on, where the traced light it
+  stands in for is noisy enough to hide them. Grain on the estimate (a fixed per-pixel
+  pattern, up to 40 % either way; 12 % was smoothed away by the title's filters before
+  the coarse step) takes the bands away: sky in steps of 1-3, the room falling off
+  evenly. Same frame time.

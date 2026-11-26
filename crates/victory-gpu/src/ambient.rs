@@ -320,6 +320,16 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
+    // Dithered: the estimate is smooth where traced light is noisy, and the
+    // title keeps it coarsely enough downstream that everything it lights
+    // (a dark room, and the sky behind a window's glass) showed bands, each
+    // step a fifth brighter than the next. The title's filters smooth the
+    // grain before that: a quarter either way left the bands as they were,
+    // four tenths either way took them away (8-bit picture, sky in steps of
+    // 1-3 instead of 5-10). A pattern of its own, not the one that picks
+    // the four points.
+    float grain = frac(52.9829189 * frac(dot(float2(p) + 17.0, float2(0.00583715, 0.06711056))));
+    found *= 1.0 + (grain - 0.5) * 0.8;
     float3 was = unpack(light[p]);
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.

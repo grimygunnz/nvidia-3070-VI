@@ -170,7 +170,7 @@ pub(crate) fn cards() -> bool {
 /// local VRAM budget (`DXGI_QUERY_VIDEO_MEMORY_INFO.Budget`), in bytes.
 ///
 /// - Unknown (`None`, e.g. WARP) or `<= 12 GiB` (8–12 GB cards, whose WDDM
-///   budget is below 12 GiB): `(16, 512)` MiB, matching the 12 GB baseline.
+///   budget is below 12 GiB): `(16, 512)` MiB when the budget is unknown, `(16, 2048)` up to 12 GiB.
 /// - `> 12 GiB` and `< 20 GiB` (16 GB cards, whose WDDM budget is typically
 ///   ~13.5–15.2 GiB): `(4, 2048)` MiB.
 /// - `>= 20 GiB` (24–32+ GB cards): `(1, (budget_mb / 4).min(8192))` MiB,
@@ -184,7 +184,12 @@ fn default_card_limits_mb(local_vram_budget: Option<u64>) -> (u64, u64) {
     const TWELVE_GIB_MB: u64 = 12 * 1024;
     const TWENTY_GIB_MB: u64 = 20 * 1024;
     if budget_mb <= TWELVE_GIB_MB {
-        (16, 512)
+        // 2,048 MB, not 512: with 512 an RTX 3070 Ti (8 GB) had 1,198 copies
+        // (591 MB) on the card and turned the rest down, the card read them
+        // over the bus and the opening's gameplay was 327 ms a frame, 245 of
+        // it waiting for the card; with 2,048, 3,596 copies (1,009 MB) and
+        // 67 ms (2026-11-26).
+        (16, 2048)
     } else if budget_mb < TWENTY_GIB_MB {
         (4, 2048)
     } else {
@@ -211,7 +216,7 @@ fn resolve_card_limits(
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
 /// `VICTORY_CARD_BUFFERS_MIN_MB` and `VICTORY_CARD_BUFFERS_MB`.
-/// Defaults scale with the adapter's local VRAM budget (16 MiB / 512 MiB on
+/// Defaults scale with the adapter's local VRAM budget (16 MiB / 2048 MiB on
 /// `<= 12 GiB` budgets, 4 MiB / 2048 MiB on 16 GB cards, 1 MiB / up to 8192 MiB
 /// on `>= 20 GiB` budgets), and explicit env vars always override.
 fn card_limits() -> (u64, u64) {
@@ -426,7 +431,17 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
         return None;
     }
-    let buffer = host.uav_buffer(size);
+    // With room past the end that nothing writes: a shader that reads past
+    // a buffer (through a root view, which has no bounds) found the next
+    // allocation's bytes in the PC's memory, and an unmapped address on the
+    // card once every buffer had its own copy there: the driver logged MMU
+    // faults in shaders and the device went, four runs in nineteen
+    // (victory-merged 8528c08, 2026-11-25). `VICTORY_CARD_PAD_KB` (64; 0: none).
+    static PAD: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let pad = *PAD.get_or_init(|| {
+        std::env::var("VICTORY_CARD_PAD_KB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(64) << 10
+    });
+    let buffer = host.uav_buffer(size + pad);
     if buffer.is_none() {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
     }
@@ -5436,9 +5451,9 @@ mod window_tests {
 
         // Unknown (WARP / query failure) and <= 12 GiB keep the 12 GB baseline.
         assert_eq!(default_card_limits_mb(None), (16, 512));
-        assert_eq!(default_card_limits_mb(Some(8 * GIB)), (16, 512));
-        assert_eq!(default_card_limits_mb(Some(11 * GIB)), (16, 512));
-        assert_eq!(default_card_limits_mb(Some(12 * GIB)), (16, 512));
+        assert_eq!(default_card_limits_mb(Some(8 * GIB)), (16, 2048));
+        assert_eq!(default_card_limits_mb(Some(11 * GIB)), (16, 2048));
+        assert_eq!(default_card_limits_mb(Some(12 * GIB)), (16, 2048));
 
         // 16 GB tier (> 12 GiB, < 20 GiB), including WDDM budgets around 13.5–15 GiB.
         assert_eq!(default_card_limits_mb(Some(13 * GIB)), (4, 2048));

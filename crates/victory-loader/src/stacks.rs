@@ -121,6 +121,11 @@ pub fn dump_stacks() {
             name_of(thread),
             locate(start_of(thread))
         );
+        let regs = *REGS.lock().unwrap_or_else(|e| e.into_inner());
+        eprintln!(
+            "    rip {:#x} rax {:#x} rbx {:#x} rcx {:#x} rdx {:#x} rsi {:#x} rdi {:#x} r12 {:#x} r13 {:#x} r14 {:#x}",
+            regs[0], regs[1], regs[2], regs[3], regs[4], regs[5], regs[6], regs[7], regs[8], regs[9]
+        );
         for (i, pc) in frames.into_iter().enumerate() {
             eprintln!("    #{i:<2} {}", locate(pc as usize));
         }
@@ -128,6 +133,10 @@ pub fn dump_stacks() {
         unsafe { CloseHandle(thread) };
     }
 }
+
+/// The registers of the thread [`frames_of`] looked at last: rip, rax, rbx,
+/// rcx, rdx, rsi, rdi, r12, r13, r14.
+static REGS: std::sync::Mutex<[u64; 10]> = std::sync::Mutex::new([0; 10]);
 
 /// The thread's frames and its current and base scheduling priority (0-31).
 pub(crate) fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32, usize)) {
@@ -172,6 +181,8 @@ pub(crate) fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32, usize)) {
     // the unwinder's own.
     unsafe {
         if GetThreadContext(thread, &mut context.0) != 0 {
+            let c = &context.0;
+            *REGS.lock().unwrap_or_else(|e| e.into_inner()) = [c.Rip, c.Rax, c.Rbx, c.Rcx, c.Rdx, c.Rsi, c.Rdi, c.R12, c.R13, c.R14];
             unwind_into(context.0, low, high, &mut frames);
         }
         ResumeThread(thread);

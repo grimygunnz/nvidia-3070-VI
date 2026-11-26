@@ -260,3 +260,17 @@ later, frame times settle by 130 s), one pair per change.
   the address that thread polls, and how the runtime puts that value there.
   The watchdog stays neutralized: by this file's own account a first run's pipelines
   can make a frame take over 30 s, which it ended.
+- **The hang behind it, found; refreshes ahead still not worth it.** Registers in the
+  stack dump (`VICTORY_STACKS` prints rip, rax, rbx, rcx, rdx, rsi, rdi, r12-r14 now)
+  showed the spinning thread on one of our fences (`rdi` in our heap), 7 signals short:
+  the line had stopped. The submitting thread waited for a list's steps' lock that
+  nothing held: a list's host side is moved out of the title's list when the
+  submission is taken (`crate::list::detach`), and the pass ahead, holding the steps'
+  lock through a reference to the old place, had the lock moved with it, locked. With
+  the pass done before the list is told translated (the list cannot be taken before),
+  the run went through: no hang, the picture right. But at 63.6 ms against 58.8: of
+  some 6,900 copies a frame the pass looked at, 330 had something new and 4,700 were
+  in the air or in the card's memory (left to the submission); the submitting thread's
+  refreshes stayed at 15.4 ms, nearly all of it 9,400 refreshes a frame finding nothing
+  new, which only it can find at its submission; and the lists' threads took 11.6 ms a
+  frame longer to say a list was translated. Taken out again.

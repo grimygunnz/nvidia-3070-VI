@@ -301,3 +301,24 @@ later, frame times settle by 130 s), one pair per change.
   into title memory (21 MB in 322 pieces), and the next refresh copies it whole and
   sends all of it up again (2.9 ms a frame). `VICTORY_SEND_CHANGED=1` (compare, send
   the dwords that changed) would send nothing of it after a landing; not measured yet.
+
+## Textures and light on 8 GB (2026-11-26 evening)
+
+- **The black walls were missing textures.** The card stood over its budget (7.4 GB
+  of 7.2) all through the prison, so the texture queue (`resource::room`) made
+  nothing: 6,400-7,300 title textures without a host copy, 28,700 slots waiting, and
+  what they showed was nothing. Let past the line (`VICTORY_TEXTURE_BUDGET_MB=9000`,
+  run texbud) every wall was there, at 430 ms a frame: 16,060 title textures took 6.0
+  GB, 46,000 more waited, the card held 13.2 GB.
+- **`VICTORY_TEXTURE_MAX_SIDE=<texels>`** (off by default): levels of a texture the
+  title fills larger than that a side are left out of its host copy (keeping the four
+  smallest), through the held levels' base level (`resource::levels_over`), which needs
+  `VICTORY_LEVELS_ON_DEMAND=0` (with 1, the tiles path makes nothing in this title and
+  every copy is whole). With 1024 (run cap1k): every wall and object there, the card at
+  6.0 GB of 7.0, 60-63 ms a frame, no device lost. The title's textures took 1.2 GB.
+- **The light stand-in.** Its bands indoors were the title's own resolve history (kept
+  up to 4x the estimate and decayed and packed again each frame) where it stood above
+  the estimate: `VICTORY_AMBIENT_MOST=<factor>` (4) bounds it, 0 drops it. The
+  estimate itself is near nothing on walls; `VICTORY_AMBIENT=constant:1.0` with
+  `AMBIENT_MOST=0` lights everything evenly, without bands but flat. The grain on the
+  estimate now moves every frame (the frame number in the spare constant).

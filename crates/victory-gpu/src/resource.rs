@@ -1271,6 +1271,7 @@ pub(crate) fn read_from(layout: &victory_formats::texture::Layout, first: u32) -
 #[cfg(windows)]
 fn base_level(desc: &ResourceDesc, first: u32) -> u32 {
     const TEXTURE_2D: u32 = 3;
+    let first = first.max(levels_over(desc));
     if first == 0
         || !fills(desc)
         || desc.dimension != TEXTURE_2D
@@ -1294,6 +1295,29 @@ fn base_level(desc: &ResourceDesc, first: u32) -> u32 {
         base -= 1;
     }
     base
+}
+
+/// Levels of a texture the title fills left out of its host copy for its
+/// size: those larger than `VICTORY_TEXTURE_MAX_SIDE` texels a side (0, the
+/// default: none), keeping at least the four smallest. On a card of 8 GB the
+/// title's textures did not fit beside the rest: the texture queue stood
+/// still at the card's line, and what it had not made showed nothing (the
+/// prison's walls black). Let past the line, the textures of the opening
+/// were 6.0 GB on the card and 46,000 more waited, at 430 ms a frame (run
+/// texbud). A level less is a quarter of the bytes; the title's shaders pick
+/// levels by the host copy's size, as they would on a card that held fewer.
+#[cfg(windows)]
+fn levels_over(desc: &ResourceDesc) -> u32 {
+    static MAX: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let max = *MAX.get_or_init(|| std::env::var("VICTORY_TEXTURE_MAX_SIDE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
+    if max == 0 || desc.mip_levels <= 4 {
+        return 0;
+    }
+    let mut over = 0;
+    while over + 4 < u32::from(desc.mip_levels) && ((desc.width >> over) > max || (u64::from(desc.height) >> over) > max) {
+        over += 1;
+    }
+    over
 }
 
 /// The bytes of title memory a placed texture with the resource description
@@ -1581,9 +1605,9 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             let wanted = r.host.wanted.load(Relaxed);
             let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
             let first = wanted.min(viewed);
-            if first != u32::MAX {
-                base = base_level(&r.desc, first);
-            }
+            // (With no view known, the levels its size leaves out still are:
+            // [`levels_over`].)
+            base = base_level(&r.desc, if first == u32::MAX { 0 } else { first });
         }
         let texture = match texture {
             Some(texture) => Some(texture),

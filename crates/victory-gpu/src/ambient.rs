@@ -112,6 +112,18 @@ fn air() -> f32 {
     })
 }
 
+/// How far the light the title's own resolve left is kept, as a multiple of
+/// the estimate (`VICTORY_AMBIENT_MOST`, 4). Without rays that light is the
+/// resolve's history, decayed and packed again every frame: where it stood
+/// above the estimate it was what was shown, in steps (the bands indoors;
+/// the grain on the estimate could not reach it).
+fn most() -> f32 {
+    static MOST: OnceLock<f32> = OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_AMBIENT_MOST").ok().and_then(|v| v.trim().parse().ok()).filter(|v: &f32| v.is_finite() && *v >= 0.0).unwrap_or(4.0)
+    })
+}
+
 /// Strength and radius of the creases' shade.
 fn shade() -> [f32; 2] {
     static SET: OnceLock<[f32; 2]> = OnceLock::new();
@@ -137,7 +149,7 @@ const SOURCE: &str = r#"
 cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
-    float follow; float most; float air; float unused;
+    float follow; float most; float air; uint frame;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -328,7 +340,11 @@ void raise(uint3 at : SV_DispatchThreadID) {
     // four tenths either way took them away (8-bit picture, sky in steps of
     // 1-3 instead of 5-10). A pattern of its own, not the one that picks
     // the four points.
-    float grain = frac(52.9829189 * frac(dot(float2(p) + 17.0, float2(0.00583715, 0.06711056))));
+    // (A new pattern each frame: the title keeps the light in this format
+    // from frame to frame, and a value that moves less than a step a frame
+    // stays where it is unless the grain moves too.)
+    float2 shift = float2(frame % 61u, (frame / 61u) % 59u) * float2(5.0, 7.0);
+    float grain = frac(52.9829189 * frac(dot(float2(p) + 17.0 + shift, float2(0.00583715, 0.06711056))));
     found *= 1.0 + (grain - 0.5) * 0.8;
     float3 was = unpack(light[p]);
     // What the program left counts as far as it can be true: the sky's light
@@ -469,7 +485,8 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[6] = views.size[0];
     words[7] = views.size[1];
     words[8] = 0.04f32.to_bits();
-    words[9] = 4.0f32.to_bits();
+    words[9] = most().to_bits();
+    words[11] = crate::frame::current() as u32;
     words[10] = air().to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's

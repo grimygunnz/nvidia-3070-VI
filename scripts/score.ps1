@@ -6,8 +6,9 @@
 #   heapwait  the wait for the heaps' records at a submission's end (last 10 lines)
 #   lost      whether the device went
 #   scripts\score.ps1 %TEMP%\victory-coolfox-<tag>-*.log.err [...] [-From 200]
+[CmdletBinding(PositionalBinding = $false)]
 param(
-    [Parameter(Mandatory, ValueFromRemainingArguments)][string[]]$Logs,
+    [Parameter(Mandatory, Position = 0, ValueFromRemainingArguments)][string[]]$Logs,
     [int]$From = 200
 )
 foreach ($pattern in $Logs) {

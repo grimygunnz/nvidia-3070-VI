@@ -93,22 +93,26 @@ gameplay frame ended in a timeout reset of the driver (event 153), with or witho
    so the render targets fit.
 3. The replay on 8 GB cards, to see the card's time by pass.
 
-## One core die (2026-11-26)
+## One core die (2026-11-26): measured, left off
 
-The Ryzen 9 5900X has two core dies, each with its own 32 MB L3. At the start of a run
-the process now keeps to the logical processors of the first last-level cache, where
-there are several and it serves at least 12 (`cores::keep_on_one_l3`;
-`VICTORY_ONE_L3=0`: all). `scripts/play-guarded.ps1 -Affinity <mask>` does the same from
-outside.
+The Ryzen 9 5900X has two core dies, each with its own 32 MB L3. `VICTORY_ONE_L3=1`
+keeps the process to the logical processors of the first last-level cache
+(`cores::keep_on_one_l3`); `scripts/play-guarded.ps1 -Affinity <mask>` does it from
+outside. The title reads how many processors there are and pins its threads across all of
+them with `SetThreadGroupAffinity`, which widened the process back to every processor: the
+runtime now keeps that call inside the process's mask (`victory-hle` `kernel`). Earlier
+runs "on one die" were on both, and their gain was noise.
 
-| | Runs | Mean |
-|---|---|---|
-| All processors | 65.5, 63.7 ms | 64.6 ms |
-| The first die (launcher's mask, then the built-in) | 60.2, 60.8, 66.6 ms | 62.5 ms |
+Runs one after another, pinned and not:
 
-About 2 ms, within the runs' spread: kept as likely, not proven. On this PC frames
-vary by some ±4 ms between runs of the same build (other programs ran meanwhile); a
-change of a few ms needs several runs on each side.
+| | Runs | Mean | Waiting for the heaps' records |
+|---|---|---|---|
+| The first die (12 threads) | 74.0, 75.5 ms | 74.8 ms | 11-14 ms |
+| Every processor (24) | 68.6, 68.9 ms | 68.8 ms | 6-7 ms |
+
+Twelve threads are too few for the title's, ours and the pools': off by default. (These
+four runs are slower than the evening's first ones, 61-65 ms: the PC's state drifts over
+a session, which is why the two sides were run in turn.)
 
 Also tried in this round, each one run: heap-sync rounds every 1 ms instead of 4
 (`VICTORY_HEAP_SYNC_EARLY=1`, 68.7 ms) and up to 16 submission parts joined

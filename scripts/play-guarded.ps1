@@ -19,6 +19,8 @@ param(
     [long]$Affinity = 0
 )
 $ErrorActionPreference = 'Stop'
+# Once per PowerShell session (several runs from one window).
+if (-not ('GuardJob' -as [type])) {
 Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
@@ -44,6 +46,7 @@ public static class GuardJob {
     }
 }
 '@
+}
 $Exe = (Resolve-Path $Exe).Path
 $Game = (Resolve-Path $Game).Path
 # Play-VIctory.cmd's settings.

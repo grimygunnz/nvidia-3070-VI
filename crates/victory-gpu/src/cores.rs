@@ -34,18 +34,21 @@ fn cpu_sets() -> Vec<(u32, u8)> {
 /// Keeps the whole process on the logical processors of one last-level
 /// cache, where the processor has several and the first serves at least 12
 /// (a Ryzen with two core dies: 6 cores, 12 threads, 32 MiB each). Called at
-/// the start of a run, before the title's threads are made.
-/// `VICTORY_ONE_L3=0`: every processor, as before.
+/// the start of a run, before the title's threads are made, with
+/// `VICTORY_ONE_L3=1` (off by default).
 ///
-/// Why: the submitting thread, its helpers, the relay and the title's threads
-/// share the tracking of title memory; spread over both dies of a Ryzen 9
-/// 5900X they passed it between two caches. On the first die only the
-/// opening's gameplay went from 65.5 and 63.7 to 60.2 and 60.8 ms a frame
-/// (2026-11-26, RTX 3070 Ti, Series S).
+/// Measured and left off: on a Ryzen 9 5900X the opening's gameplay was
+/// 74.0 and 75.5 ms a frame on the first die against 68.6 and 68.9 on both
+/// (runs one after another, 2026-11-26, RTX 3070 Ti, Series S): with 12
+/// threads for the title's, ours and the pools', the submitting thread
+/// waited twice as long for the heaps' records. (Runs before the title's
+/// `SetThreadGroupAffinity` was kept inside the process's mask
+/// (`victory_hle` `kernel`) were not on one die at all: the title widened
+/// the process back to every processor.)
 pub fn keep_on_one_l3() {
     use windows_sys::Win32::System::SystemInformation::{GetSystemCpuSetInformation, SYSTEM_CPU_SET_INFORMATION};
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, SetProcessAffinityMask};
-    if std::env::var_os("VICTORY_ONE_L3").is_some_and(|v| v == "0") {
+    if std::env::var_os("VICTORY_ONE_L3").is_none_or(|v| v != "1") {
         return;
     }
     let mut bytes = 0u32;
@@ -78,7 +81,7 @@ pub fn keep_on_one_l3() {
     }
     // SAFETY: our own process, a mask of processors it has.
     if unsafe { SetProcessAffinityMask(GetCurrentProcess(), mask) } != 0 {
-        tracing::info!(cache, mask = format_args!("{mask:#x}"), caches = caches.len(), "the process is kept on the processors of one last-level cache (VICTORY_ONE_L3=0: all)");
+        tracing::info!(cache, mask = format_args!("{mask:#x}"), caches = caches.len(), "the process is kept on the processors of one last-level cache (VICTORY_ONE_L3=1)");
     }
 }
 

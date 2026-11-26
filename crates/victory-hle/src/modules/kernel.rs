@@ -434,6 +434,45 @@ pub extern "system" fn SetThreadPriority(thread: *mut c_void, priority: i32) -> 
     unsafe { windows_sys::Win32::System::Threading::SetThreadPriority(thread, priority) }
 }
 
+/// `SetThreadGroupAffinity`, with the mask kept inside the process's own
+/// (`victory_gpu::keep_on_one_l3`): the title reads how many processors
+/// there are and pins its threads across all of them, which widened the
+/// process back to every processor (2026-11-26: the process was found on
+/// all 24 of a Ryzen 9 5900X twenty seconds into a run that had kept it to
+/// one die's 12). A mask with nothing of the process's left is the
+/// process's whole mask.
+pub extern "system" fn SetThreadGroupAffinity(thread: *mut c_void, wanted: *const GroupAffinity, previous: *mut GroupAffinity) -> i32 {
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessAffinityMask};
+    if wanted.is_null() {
+        return 0;
+    }
+    // SAFETY: the title passes a group affinity to read.
+    let mut asked = unsafe { wanted.read() };
+    let (mut process, mut system) = (0usize, 0usize);
+    // SAFETY: our own process; plain out values.
+    if asked.group == 0 && unsafe { GetProcessAffinityMask(GetCurrentProcess(), &mut process, &mut system) } != 0 && process != system {
+        let kept = asked.mask & process;
+        asked.mask = if kept == 0 { process } else { kept };
+    }
+    // SAFETY: the same arguments, the mask possibly narrowed.
+    unsafe {
+        windows_sys::Win32::System::Threading::SetThreadGroupAffinity(
+            thread,
+            (&raw const asked).cast(),
+            previous.cast(),
+        )
+    }
+}
+
+/// `GROUP_AFFINITY`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GroupAffinity {
+    mask: usize,
+    group: u16,
+    reserved: [u16; 3],
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "kernel",
@@ -442,6 +481,7 @@ pub(crate) fn module() -> HleModule {
             "kernelbase.dll",
             "api-ms-win-core-libraryloader-*",
             "api-ms-win-core-processthreads-*",
+            "api-ms-win-core-processtopology-*",
             "api-ms-win-core-debug-*",
             "api-ms-win-core-errorhandling-*",
             "api-ms-win-crt-runtime-*",
@@ -469,6 +509,7 @@ pub(crate) fn module() -> HleModule {
             hle_export!(TerminateProcess),
             hle_export!(SetUnhandledExceptionFilter),
             hle_export!(SetThreadPriority),
+            hle_export!(SetThreadGroupAffinity),
         ],
     }
 }

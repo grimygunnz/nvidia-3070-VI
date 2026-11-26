@@ -7489,6 +7489,19 @@ impl std::hash::Hasher for AddressHash {
 #[cfg(feature = "diagnostics")]
 static SPLIT: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
 
+/// Since the last frame line: [`timed_nothing_new`]'s calls, nanoseconds
+/// in them (all threads), and the big flushes' wall nanoseconds.
+pub(crate) static NOTHING_NEW: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// `Shadow::nothing_new` on a thread of a big flush, timed ([`NOTHING_NEW`]).
+fn timed_nothing_new(shadow: &crate::shadow::Shadow, from: usize, to: usize) -> bool {
+    let began = std::time::Instant::now();
+    let same = shadow.nothing_new(from, to - from);
+    NOTHING_NEW[0].fetch_add(1, Ordering::Relaxed);
+    NOTHING_NEW[1].fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    same
+}
+
 /// Since the last frame-rate line: flushes of refreshes, their refreshes,
 /// those known to copy nothing, and those done on several threads.
 #[cfg(feature = "diagnostics")]
@@ -7519,6 +7532,13 @@ impl Split {
 /// The split of the preparing, per frame, for the frame-rate line.
 #[cfg(feature = "diagnostics")]
 fn split_line(frames: f64) {
+    {
+        let n: Vec<f64> = NOTHING_NEW.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        tracing::info!(
+            "refreshes of big flushes per frame: {:.0} looks known to copy nothing taking {:.2} ms (all threads), the big flushes {:.2} ms from first to last",
+            n[0], n[1] / 1e6, n[2] / 1e6
+        );
+    }
     let ms: Vec<f64> = SPLIT.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames).collect();
     let f: Vec<f64> = FLUSHES.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     let e: Vec<f64> = crate::watch::early_asks().iter().map(|&n| n as f64 / frames).collect();
@@ -8029,6 +8049,7 @@ impl Batch {
         }
         #[cfg(feature = "diagnostics")]
         FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
+        let wall = std::time::Instant::now();
         crate::shadow::wide_each(spans.len() + due.len(), move |i| {
             // The textures first: they are the longer pieces.
             let Some(i) = i.checked_sub(due.len()) else {
@@ -8036,13 +8057,16 @@ impl Batch {
                 return;
             };
             let (shadow, from, to) = &spans[i];
-            if many && shadow.nothing_new(*from, *to - *from) {
+            if many && timed_nothing_new(shadow, *from, *to) {
                 #[cfg(feature = "diagnostics")]
                 FLUSHES[2].fetch_add(1, Ordering::Relaxed);
                 return;
             }
             Self::update(shadow, *from, *to);
         });
+        if many {
+            NOTHING_NEW[2].fetch_add(wall.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
         if ahead {
             crate::watch::ask_ahead_done();
         }
@@ -8206,15 +8230,20 @@ impl Batch {
             if light {
                 // A number to a free thread, not a job to each copy.
                 let refreshes = std::mem::take(&mut self.refreshes);
+                let big = refreshes.len() > FEW;
+                let wall = std::time::Instant::now();
                 crate::shadow::wide_each(refreshes.len(), move |i| {
                     let (shadow, from, to) = &refreshes[i];
-                    if refreshes.len() > FEW && shadow.nothing_new(*from, *to - *from) {
+                    if refreshes.len() > FEW && timed_nothing_new(shadow, *from, *to) {
                         #[cfg(feature = "diagnostics")]
                         FLUSHES[2].fetch_add(1, Ordering::Relaxed);
                         return;
                     }
                     Self::update(shadow, *from, *to);
                 });
+                if big {
+                    NOTHING_NEW[2].fetch_add(wall.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                }
             } else {
                 let jobs: Vec<Box<dyn FnOnce() + Send>> = self
                     .refreshes

@@ -241,3 +241,22 @@ later, frame times settle by 130 s), one pair per change.
   together. The title has something there that depends on when the flights land, and
   finding it means following its code at that address. Until then the submitting
   thread keeps the refreshes.
+- **The crash, followed into the title.** `+0x23cf683` is no fault of the title's:
+  it is `mov dword ptr [0], 4D8BD421h` at the end of a handler that decodes and reports
+  "GPU Loc Sig" (`+0x23cf620`). The title's main thread installs it while it waits on
+  an event of its own at the opening cutscene's start (`+0x23cf6a0`), and the title's
+  hang watchdog (a thread at `+0x2215a60`, waking every second: a watched scope of a
+  thread too old, through a check at `+0x9d3e70` not read yet, or 30 wakes with no
+  progress told) calls it, then stores to 0 itself (`+0x2215c35`). With the
+  watchdog's three jumps to those ends made no-ops (`crates/victory-loader/src/
+  watchdog.rs`, only where the bytes are that build's; `VICTORY_TITLE_WATCHDOG=1`
+  keeps it) the refreshes ahead no longer crashed: the title hung instead, its loading
+  screen shown at 30 fps (stacks at 90 s, `VICTORY_STACKS=90`). The main thread waits on
+  that event (`+0x23ceeb0`, `+0x23cf735`); the thread that would set it
+  (`+0x23cf104`) spins in `monitorx`/`mwaitx` (`+0x4fb0c00`) for a 64-bit value in
+  memory to reach a target: a fence value of the title's, which never comes. That is
+  so even with the pass ahead refreshing nothing; why a pass that only looks makes a
+  fence value not arrive is not found yet (no wait in its path was over 50 ms). Next:
+  the address that thread polls, and how the runtime puts that value there.
+  The watchdog stays neutralized: by this file's own account a first run's pipelines
+  can make a frame take over 30 s, which it ended.

@@ -84,6 +84,10 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
         // SAFETY: just mapped, and no title code has run.
         unsafe { crate::tls::redirect(loaded.base(), &loaded.info) }?;
     }
+    // SAFETY: just mapped, and no title code has run.
+    if unsafe { crate::watchdog::neutralize(loaded.base(), loaded.info.size_of_image as usize) } {
+        tracing::info!("the title's hang watchdog will not end the run (VICTORY_TITLE_WATCHDOG=1 keeps it)");
+    }
     tracing::info!(
         base = format_args!("{:#x}", loaded.base()),
         preferred = format_args!("{:#x}", loaded.info.image_base),

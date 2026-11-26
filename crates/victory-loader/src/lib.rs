@@ -40,6 +40,8 @@ mod tls;
 #[cfg(windows)]
 pub mod write_sites;
 #[cfg(windows)]
+mod watchdog;
+#[cfg(windows)]
 mod windows;
 
 #[cfg(windows)]

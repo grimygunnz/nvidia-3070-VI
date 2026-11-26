@@ -462,6 +462,25 @@ fn raw_compute(desc: *const u8) -> Option<Vec<u8>> {
     if metadata.get(8..12).map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")) as usize * 4) != Some(code.len()) {
         return None;
     }
+    // Diagnostics: each kind of resource record not of a root type the FSPX
+    // reader takes yet, once, with its bytes.
+    #[cfg(feature = "diagnostics")]
+    {
+        static SAID: std::sync::Mutex<Vec<(u8, u8, u8)>> = std::sync::Mutex::new(Vec::new());
+        for r in metadata.get(0x18..).unwrap_or(&[]).chunks_exact(32) {
+            if r[0] == 0x43 {
+                break;
+            }
+            if r[0] == 0x41 && !matches!(r[5], 1 | 3 | 4) {
+                let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+                if !said.contains(&(r[4], r[5], r[20])) {
+                    said.push((r[4], r[5], r[20]));
+                    let hex: String = r.iter().map(|b| format!("{b:02x}")).collect();
+                    tracing::warn!(kind = r[4], root = r[5], dwords = r[20], "device method 0x218: an FSPX resource record of a root type not read yet: {hex}");
+                }
+            }
+        }
+    }
     let mut digest = [0u8; 16];
     digest[..8].copy_from_slice(&word(11).to_le_bytes());
     digest[8..].copy_from_slice(&blake3::hash(&code).as_bytes()[..8]);

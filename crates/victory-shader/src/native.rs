@@ -537,6 +537,9 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
             RootType::Descriptor => 2,
             // The code holds its words; no user data.
             RootType::ImmediateSampler => 0,
+            // Root constants, their dwords in user data (device method
+            // 0x218's pipelines: four, from user-data dword 5).
+            RootType::Constants => u32::from(u.dwords),
             _ => return Err(Malformed("an FSPX resource of an unknown root type")),
         };
         if sgprs > 0 && !layout.iter().any(|p| p.slot == u.slot) {

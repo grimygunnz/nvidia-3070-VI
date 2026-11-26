@@ -21,8 +21,9 @@ use crate::structure::{Bool, LaneExit, Meets, Structured};
 /// An instruction: block and index in [`crate::ir::Block::insts`].
 pub type Site = (usize, usize);
 
-/// A byte address: a root parameter's, plus a constant and at most one
-/// value the program computes (an index times a stride, say).
+/// A byte address: a root parameter's, plus a constant and at most two
+/// values the program computes (an index times a stride, say; the second,
+/// [`Address::dynamic2`], only beside a first).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Address {
     /// Index into the layout, or [`CODE`].
@@ -31,6 +32,11 @@ pub struct Address {
     /// descriptor's address).
     pub offset: u32,
     pub dynamic: Option<Value>,
+    /// A second computed term, added as the first is: an address in SGPRs
+    /// that holds one, read with a VGPR offset or `soffset` that is another
+    /// (the pipelines device method 0x218 makes: 451 of 800 refused for
+    /// this). Never for [`CODE`].
+    pub dynamic2: Option<Value>,
 }
 
 /// [`Address::param`] of the program's own code: a constant table the
@@ -623,6 +629,9 @@ impl<'a> Tracer<'a> {
         if base.root != RootType::Table {
             return None;
         }
+        if address.dynamic2.is_some() {
+            return None;
+        }
         let dynamic = address.dynamic?;
         let (input, shift) = match self.sop2(dynamic, &["s_lshl_b32"]) {
             Some((_, [Term::Value(input), Term::Const(shift)])) => (input, (shift & 31) as u8),
@@ -887,6 +896,7 @@ impl<'a> Tracer<'a> {
                 param: MEMORY,
                 offset: 0,
                 dynamic: None,
+                dynamic2: None,
             })
         } else {
             Err(why)
@@ -951,11 +961,12 @@ impl<'a> Tracer<'a> {
             _ => hi,
         };
         let s = self.sum(lo);
-        if s.dynamic.is_some() && extra.dynamic.is_some() {
-            return Err("an address with two computed terms");
-        }
+        let two = s.dynamic.is_some() && extra.dynamic.is_some();
         let base = s.base.ok_or_else(|| self.why_no_base(s.dynamic))?;
         if let Some(pc) = self.getpc(base) {
+            if two {
+                return Err("an address with two computed terms");
+            }
             // A table in the code: the base is the next instruction's offset.
             let high = pc.writes.get(1).map(|w| w.1);
             if !self.high_half(hi, high) && !high.is_some_and(|h| self.carried(hi, h)) {
@@ -969,6 +980,7 @@ impl<'a> Tracer<'a> {
                 param: CODE,
                 offset: first.wrapping_add(s.offset).wrapping_add(extra.offset),
                 dynamic: s.dynamic.or(extra.dynamic),
+                dynamic2: None,
             });
         }
         let reg = self.inputs[base.0 as usize].ok_or("an address not from a root parameter")?;
@@ -996,6 +1008,7 @@ impl<'a> Tracer<'a> {
             param,
             offset: s.offset.wrapping_add(extra.offset),
             dynamic: s.dynamic.or(extra.dynamic),
+            dynamic2: if two { extra.dynamic } else { None },
         })
     }
 
@@ -1269,7 +1282,7 @@ impl<'a> Tracer<'a> {
     fn anywhere(&self, source: &Source) -> bool {
         match source {
             Source::Constant(_) => true,
-            Source::Built { address, .. } => address.dynamic.is_none(),
+            Source::Built { address, .. } => address.dynamic.is_none() && address.dynamic2.is_none(),
             Source::Loaded { load, .. } => {
                 let inst = self.inst(*load);
                 match &inst.fields {
@@ -1280,7 +1293,7 @@ impl<'a> Tracer<'a> {
                         ..
                     } => self
                         .smem_address(inst, base, *offset, soffset)
-                        .is_ok_and(|a| a.dynamic.is_none()),
+                        .is_ok_and(|a| a.dynamic.is_none() && a.dynamic2.is_none()),
                     _ => false,
                 }
             }
@@ -1767,7 +1780,7 @@ impl<'a> Tracer<'a> {
             self.runs(site, known)?;
             let a = address(site)?;
             let want = a0.offset.wrapping_add(4 * (first + k) as u32);
-            if (a.param, a.dynamic) != (a0.param, a0.dynamic)
+            if (a.param, a.dynamic, a.dynamic2) != (a0.param, a0.dynamic, a0.dynamic2)
                 || a.offset.wrapping_add(4 * dword as u32) != want
             {
                 return Err("a descriptor read from the first lane of loads that do not line up");
@@ -2210,7 +2223,7 @@ impl<'a> Tracer<'a> {
             }
         };
         let a = address(*loads.first()?)?;
-        if a.dynamic.is_some() || loads.iter().any(|&l| address(l) != Some(a)) {
+        if a.dynamic.is_some() || a.dynamic2.is_some() || loads.iter().any(|&l| address(l) != Some(a)) {
             return None;
         }
         // The handle is made where the descriptor is used, from the load's
@@ -2513,6 +2526,7 @@ pub(crate) mod tests {
             param,
             offset,
             dynamic: None,
+            dynamic2: None,
         }
     }
 

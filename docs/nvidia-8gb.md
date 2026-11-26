@@ -201,3 +201,15 @@ later, frame times settle by 130 s), one pair per change.
   their dispatches are dropped: 40 ms a frame, for a frame missing that work. Method
   0x1c8 is the graphics counterpart (a 388-byte register block, an input layout of
   POSITION, COLOR, TEXCOORD): not written.
+- **Device method 0x218, followed further.** The FSPX reader now takes root
+  constants (the one resource record of an unknown root type: a CBV of 4 dwords in
+  user data from dword 5, root slot 1), and an address may hold two computed terms
+  (`Address::dynamic2`: an SGPR address holding one, read with a VGPR offset holding
+  the other). Still 803 fail, now first for a descriptor the code loads and remakes as
+  a raw view of the same memory (stride cleared, bounds in bytes, read by byte offset
+  or with a format), then addresses not from a root parameter. **Not worth finishing
+  for speed:** 662 of the 1,019 compute programs the title makes this way have a
+  container program of the same group size and nearly the same code length; they are
+  the title's precompiled forms of shaders it otherwise makes of containers, which
+  translate and run now. Made this way the work is the same; the 40 ms frames were the
+  work dropped (the screen grey but for the prompts). `VICTORY_RAW_COMPUTE` stays off.

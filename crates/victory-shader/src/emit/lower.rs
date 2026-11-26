@@ -1839,7 +1839,7 @@ impl<'a> Lower<'a> {
         };
         let c = self.cur;
         let mut off = self.s.m.i32(a.offset);
-        if let Some(d) = a.dynamic {
+        for d in a.dynamic.into_iter().chain(a.dynamic2) {
             let d = self.i32_of(d)?;
             off = self.s.m.bin(c, Bin::Add, off, d);
         }
@@ -2975,7 +2975,7 @@ impl<'a> Lower<'a> {
         let Source::Loaded { load, first } = src else {
             return None;
         };
-        let a = self.scalar.get(load).filter(|a| a.dynamic.is_none())?;
+        let a = self.scalar.get(load).filter(|a| a.dynamic.is_none() && a.dynamic2.is_none())?;
         Some((a.param, a.offset + 4 * u32::from(*first)))
     }
 
@@ -3039,6 +3039,7 @@ impl<'a> Lower<'a> {
                 let a = self.scalar.get(&site)?;
                 let buffer = used.dwords == 4
                     && a.dynamic.is_none()
+                    && a.dynamic2.is_none()
                     && used.table_offset_dwords == a.offset / 4
                     && matches!(used.kind, ResourceType::Srv | ResourceType::Uav)
                     && used.stride > 4
@@ -3059,7 +3060,7 @@ impl<'a> Lower<'a> {
         use super::shader::USER_VIEW_ADDRESS;
         let a = self.scalar.get(&site).copied()?;
         let rp = *self.x.native.layout.get(a.param)?;
-        if rp.root != RootType::Table || a.dynamic.is_some() || a.offset % 32 != 0 {
+        if rp.root != RootType::Table || a.dynamic.is_some() || a.dynamic2.is_some() || a.offset % 32 != 0 {
             return None;
         }
         let dword = a.offset / 4;
@@ -7115,6 +7116,13 @@ impl<'a> Lower<'a> {
                     Some(v) => Some(self.i32_of(v)?),
                     None => None,
                 };
+                if let Some(v) = address.dynamic2 {
+                    let v = self.i32_of(v)?;
+                    x = Some(match x {
+                        Some(d) => self.s.m.bin(self.cur, Bin::Add, d, v),
+                        None => v,
+                    });
+                }
                 if let Some(bias) = self.root_bias(address.param) {
                     x = Some(match x {
                         Some(d) => self.s.m.bin(self.cur, Bin::Add, d, bias),

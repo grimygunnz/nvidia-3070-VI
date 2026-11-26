@@ -213,3 +213,16 @@ later, frame times settle by 130 s), one pair per change.
   the title's precompiled forms of shaders it otherwise makes of containers, which
   translate and run now. Made this way the work is the same; the 40 ms frames were the
   work dropped (the screen grey but for the prompts). `VICTORY_RAW_COMPUTE` stays off.
+- **Refreshes ahead of the submitting thread, tried and taken out.** The threads that
+  translate the title's lists brought each list's host copies up to date once it was
+  translated (`VICTORY_PREFETCH=1`), while the submitting thread was on the ones
+  before. The title crashed 35 s into the run (a write to null in its code at frame
+  1269, just after a read-back): a refresh from title memory can come between a
+  flight's shader writes (a texture copied into a buffer the title reads back) and
+  their landing in title memory, and the title then reads what was there before. The
+  submitting thread settles such flights, under the submission lock, before it
+  refreshes what they write (`stale_under_flights`); a thread outside the lock cannot
+  know that nothing is sent between its look and its refresh, and with the relay
+  something is nearly always in the air. Moving the refreshes off that thread needs
+  the flights' bookkeeping to say, per range, what is still to land, from before the
+  lists are sent.

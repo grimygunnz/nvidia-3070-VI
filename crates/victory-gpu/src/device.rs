@@ -365,6 +365,23 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
     use std::sync::atomic::{AtomicU32, Ordering};
     static CALLS: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
     let calls = CALLS[usize::from(SLOT == 0x218)].fetch_add(1, Ordering::Relaxed) + 1;
+    #[cfg(windows)]
+    // Off unless asked for (`VICTORY_RAW_COMPUTE=1`): with these made, the
+    // title makes all its compute pipelines this way (run raw: 821 shaders
+    // that do not translate, 482 of them for FSPX resources of root types
+    // not known yet, the rest for code the translator refuses) and draws
+    // with them in place of the ones it makes of containers, which do.
+    if SLOT == 0x218 && std::env::var_os("VICTORY_RAW_COMPUTE").is_some_and(|v| v == "1") {
+        match raw_compute(desc) {
+            Some(container) => {
+                if calls <= 4 {
+                    tracing::info!(calls, bytes = container.len(), "device method 0x218: a compute pipeline of the title's own code, made as an FSPX container");
+                }
+                return crate::pipeline::create_compute_of(&container, _iid, out);
+            }
+            None => tracing::warn!(calls, "device method 0x218: a description not understood"),
+        }
+    }
     if !out.is_null() {
         // SAFETY: the title's out pointer (a local of its own).
         unsafe { *out = std::ptr::null() };
@@ -388,6 +405,22 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         let first = description
             .as_ref()
             .and_then(|w| words(w[0] as usize));
+        // The pieces the description names (pointer, length pairs at words
+        // 1, 3, 5, 7), as hex, for the first calls: they look like an FSPX
+        // part's entries (registers 0x1c, hash 0x14, code, metadata).
+        #[cfg(windows)]
+        if calls <= 2
+            && let Some(w) = description.as_ref()
+        {
+            for (n, pair) in [(1usize, 2usize), (3, 4), (5, 6), (7, 8)].into_iter().enumerate() {
+                let (at, len) = (w[pair.0] as usize, (w[pair.1] as usize).min(0x400));
+                let mut bytes = vec![0u8; len];
+                if at != 0 && crate::host::read_into(at as *const u8, &mut bytes) {
+                    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+                    tracing::warn!(slot = format_args!("{:#x}", SLOT), calls, piece = n, len, "{hex}");
+                }
+            }
+        }
         tracing::warn!(
             slot = format_args!("{:#x}", SLOT),
             calls,
@@ -397,6 +430,42 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         );
     }
     E_NOTIMPL
+}
+
+/// The container for device method 0x218's description at `desc`: twelve
+/// words, the root signature, then (pointer, length) of the pipeline's
+/// registers (0x1c bytes), its hash (0x14), the code and the program's
+/// metadata, then two pointers and a 64-bit hash of the pipeline. The pieces
+/// are an FSPX part's entries (seen in run pspina: 8x8x1 threads, metadata
+/// 0x403 with the code's dword count, 0x41/0x42/0x43 records), so the
+/// translator takes them as it takes the upscaler's shaders.
+#[cfg(windows)]
+fn raw_compute(desc: *const u8) -> Option<Vec<u8>> {
+    let mut words = [0u8; 96];
+    if desc.is_null() || !crate::host::read_into(desc, &mut words) {
+        return None;
+    }
+    let word = |i: usize| u64::from_le_bytes(words[8 * i..8 * i + 8].try_into().expect("8 bytes"));
+    let piece = |i: usize, most: usize| -> Option<Vec<u8>> {
+        let (at, len) = (word(i) as usize, word(i + 1) as usize);
+        if at == 0 || len == 0 || len > most {
+            return None;
+        }
+        let mut bytes = vec![0u8; len];
+        crate::host::read_into(at as *const u8, &mut bytes).then_some(bytes)
+    };
+    let registers = piece(1, 0x1c).filter(|p| p.len() == 0x1c)?;
+    let hash = piece(3, 0x100)?;
+    let code = piece(5, 1 << 20)?;
+    let metadata = piece(7, 1 << 16)?;
+    // The code's dword count, as the metadata gives it.
+    if metadata.get(8..12).map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")) as usize * 4) != Some(code.len()) {
+        return None;
+    }
+    let mut digest = [0u8; 16];
+    digest[..8].copy_from_slice(&word(11).to_le_bytes());
+    digest[8..].copy_from_slice(&blake3::hash(&code).as_bytes()[..8]);
+    Some(crate::pipeline::fspx_container(&registers, &hash, &code, &metadata, digest))
 }
 
 /// The host device's state: the console's device is removed when the host's is

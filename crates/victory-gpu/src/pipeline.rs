@@ -636,6 +636,59 @@ pub(crate) extern "system" fn create_compute(
     )
 }
 
+/// A compute pipeline of a container the host made itself (device method
+/// 0x218: `crate::device`), as [`create_compute`] makes one of the title's.
+pub(crate) fn create_compute_of(container: &[u8], iid: *const Iid, out: *mut This) -> HRESULT {
+    hand_out(
+        vec![shader("compute", container)],
+        #[cfg(windows)]
+        None,
+        iid,
+        out,
+    )
+}
+
+/// An `ACCC` container around an FSPX part ([`victory_shader::native::fspx_program`]
+/// reads it) of the four pieces a description of device method 0x218 names:
+/// the pipeline's registers (0x1c bytes), its hash (0x14), the code and the
+/// program's metadata. The container's digest is the pipeline's hash.
+pub(crate) fn fspx_container(registers: &[u8], hash: &[u8], code: &[u8], metadata: &[u8], digest: [u8; 16]) -> Vec<u8> {
+    let pieces: [(u32, &[u8]); 4] = [(0, registers), (1, hash), (6, code), (7, metadata)];
+    let mut fspx = Vec::new();
+    fspx.extend_from_slice(b"FSPX");
+    fspx.extend_from_slice(&1u32.to_le_bytes());
+    fspx.extend_from_slice(&(pieces.len() as u32).to_le_bytes());
+    fspx.extend_from_slice(&0u32.to_le_bytes());
+    let mut at = 0x10 + 16 * pieces.len();
+    for (kind, piece) in &pieces {
+        at = at.next_multiple_of(4);
+        for word in [*kind, at as u32, piece.len() as u32, 0] {
+            fspx.extend_from_slice(&word.to_le_bytes());
+        }
+        at += piece.len();
+    }
+    for (_, piece) in &pieces {
+        fspx.resize(fspx.len().next_multiple_of(4), 0);
+        fspx.extend_from_slice(piece);
+    }
+    let size = fspx.len() as u32;
+    fspx[12..16].copy_from_slice(&size.to_le_bytes());
+    // The container: header, one part's offset, the part.
+    let total = 0x20 + 4 + 8 + fspx.len();
+    let mut c = Vec::with_capacity(total);
+    c.extend_from_slice(b"DXBC");
+    c.extend_from_slice(&digest);
+    c.extend_from_slice(&1u16.to_le_bytes());
+    c.extend_from_slice(&0u16.to_le_bytes());
+    c.extend_from_slice(&(total as u32).to_le_bytes());
+    c.extend_from_slice(&1u32.to_le_bytes());
+    c.extend_from_slice(&0x24u32.to_le_bytes());
+    c.extend_from_slice(b"ACCC");
+    c.extend_from_slice(&(fspx.len() as u32).to_le_bytes());
+    c.extend_from_slice(&fspx);
+    c
+}
+
 /// Device method 0x1f0: the plain compute description plus console
 /// extensions `(desc, extension count, extensions, iid, out)`.
 /// shortcut: the extensions (console shader settings) are ignored, as is
@@ -793,6 +846,41 @@ pub fn save_pipeline_cache() {
 
 #[cfg(test)]
 mod tests {
+    /// Pieces laid out as device method 0x218's (made up here: no code of
+    /// the title's): the FSPX container of them reads back as a compute
+    /// program of their group size, wave and code.
+    #[test]
+    fn fspx_container_reads_back() {
+        let mut registers = vec![0u8; 0x1c];
+        for (i, n) in [8u16, 8, 1].iter().enumerate() {
+            registers[0x0c + 2 * i..0x0e + 2 * i].copy_from_slice(&n.to_le_bytes());
+        }
+        registers[0x14..0x18].copy_from_slice(&0x402c_0343u32.to_le_bytes());
+        registers[0x18..0x1c].copy_from_slice(&0x0b8au32.to_le_bytes());
+        let code: Vec<u8> = [0xbf81_0000u32; 4].iter().flat_map(|w| w.to_le_bytes()).collect();
+        let mut metadata = vec![0u8; 0x18];
+        metadata[0..4].copy_from_slice(&0x403u32.to_le_bytes());
+        metadata[8..12].copy_from_slice(&4u32.to_le_bytes());
+        let mut last = [0u8; 32];
+        last[0] = 0x43;
+        metadata.extend_from_slice(&last);
+        let size = (metadata.len() - 0x14) as u32;
+        metadata[4..8].copy_from_slice(&size.to_le_bytes());
+        let c = super::fspx_container(&registers, &[0; 0x14], &code, &metadata, [7; 16]);
+        let parsed = victory_shader::Container::parse(&c).expect("a container");
+        assert_eq!(parsed.digest, [7; 16]);
+        let part = parsed.part(victory_shader::FourCC::ACCC).expect("an ACCC part");
+        let programs = victory_shader::native_programs(part.data).expect("an FSPX part");
+        assert_eq!(programs.len(), 1);
+        let p = &programs[0];
+        assert!(p.wave64);
+        assert_eq!(p.code, code);
+        match &p.io {
+            victory_shader::native::StageIo::Cs(cs) => assert_eq!((cs.threads, cs.rsrc2), ([8, 8, 1], 0x0b8a)),
+            _ => panic!("not compute"),
+        }
+    }
+
     #[cfg(all(windows, feature = "diagnostics"))]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {

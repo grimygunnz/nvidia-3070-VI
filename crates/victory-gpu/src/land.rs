@@ -253,6 +253,16 @@ impl Pool {
         let mut state = self.state();
         loop {
             let Some((work, i)) = take(&mut state) else {
+                // Awake a little while first (`VICTORY_POOL_SPIN`): a
+                // helper put to sleep took long to run again once woken.
+                if let Some(again) = self.spun(state) {
+                    state = again;
+                    continue;
+                }
+                state = self.state();
+                if state.work.is_some() && state.next < state.count {
+                    continue;
+                }
                 state = self.more.wait(state).unwrap_or_else(|e| e.into_inner());
                 continue;
             };
@@ -269,6 +279,29 @@ impl Pool {
                 self.idle.notify_all();
             }
         }
+    }
+
+    /// With the state let go, a look at it now and then for up to
+    /// [`pool_spin`]: the state held, if work came meanwhile.
+    fn spun<'a>(&'a self, state: MutexGuard<'a, State>) -> Option<MutexGuard<'a, State>> {
+        let most = pool_spin();
+        drop(state);
+        if most.is_zero() {
+            return None;
+        }
+        let began = std::time::Instant::now();
+        while began.elapsed() < most {
+            for _ in 0..64 {
+                std::hint::spin_loop();
+            }
+            if let Ok(state) = self.state.try_lock()
+                && state.work.is_some()
+                && state.next < state.count
+            {
+                return Some(state);
+            }
+        }
+        None
     }
 
     /// Calls `f` with every number below `count`, on the pool's threads and
@@ -310,6 +343,15 @@ impl Pool {
         }
         assert!(!panicked, "a job of landing panicked");
     }
+}
+
+/// How long a helper of the pools stays awake for more work before it sleeps
+/// (`VICTORY_POOL_SPIN`, microseconds; 0, the default: it sleeps at once).
+fn pool_spin() -> std::time::Duration {
+    static US: OnceLock<u64> = OnceLock::new();
+    std::time::Duration::from_micros(*US.get_or_init(|| {
+        std::env::var("VICTORY_POOL_SPIN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+    }))
 }
 
 /// The next number of the batch, if there is one.

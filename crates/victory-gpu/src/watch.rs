@@ -192,7 +192,7 @@ pub(crate) fn lock_waits(frames: f64) -> String {
         let [n, ns] = [0, 1].map(|i| WAITS[what][i].swap(0, std::sync::atomic::Ordering::Relaxed));
         format!("{:.0} {:.2} ms", n as f64 / frames, ns as f64 / 1e6 / frames)
     };
-    format!("ranges held {}, journal read {}, journal noted in {}, guards {}", of(0), of(1), of(2), of(3))
+    format!("ranges held {}, journal read {}, journal noted in {}, guards {}; the guards held 20 us or more, by watch.rs line: {}", of(0), of(1), of(2), of(3), holds(frames))
 }
 
 /// The page ranges some thread is asking about: asking forgets what it
@@ -1206,7 +1206,8 @@ pub(crate) fn asks() -> [u64; 13] {
 }
 
 /// The guards' lock, the wait for it counted.
-fn guards_timed() -> std::sync::MutexGuard<'static, Guards> {
+#[track_caller]
+fn guards_timed() -> Held {
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     let g = guards();
@@ -1425,11 +1426,119 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     opened: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
 });
 
-fn guards() -> std::sync::MutexGuard<'static, Guards> {
-    if let Ok(g) = GUARDS.try_lock() {
-        return g;
+#[track_caller]
+fn guards() -> Held {
+    let g = match GUARDS.try_lock() {
+        Ok(g) => g,
+        Err(_) => waited(3, || spun().unwrap_or_else(|| GUARDS.lock().unwrap_or_else(|e| e.into_inner()))),
+    };
+    #[cfg(feature = "diagnostics")]
+    let g = Held(g, std::time::Instant::now(), std::panic::Location::caller());
+    g
+}
+
+/// The guards' lock if it comes free within [`spin`] of trying for it,
+/// before the thread sleeps on it.
+///
+/// It is held 6 us at a time on average, some 1,800 times a frame by every
+/// thread together, 12 ms in all; yet the 350 waits a frame for it came to
+/// 53 ms, 150 us each (run holds2): the time a thread put to sleep on the
+/// lock takes to run again once it is let go, on a processor the title's
+/// threads and ours keep busy. A wait that spins through a hold is over when
+/// the hold is.
+fn spun() -> Option<std::sync::MutexGuard<'static, Guards>> {
+    let spin = spin();
+    if spin.is_zero() {
+        return None;
     }
-    waited(3, || GUARDS.lock().unwrap_or_else(|e| e.into_inner()))
+    let began = std::time::Instant::now();
+    loop {
+        for _ in 0..64 {
+            std::hint::spin_loop();
+        }
+        match GUARDS.try_lock() {
+            Ok(g) => return Some(g),
+            Err(std::sync::TryLockError::Poisoned(e)) => return Some(e.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
+        if began.elapsed() >= spin {
+            return None;
+        }
+    }
+}
+
+/// How long a thread spins for the guards' lock before it sleeps on it
+/// (`VICTORY_GUARD_SPIN`, microseconds; 0: it sleeps at once, as before).
+fn spin() -> std::time::Duration {
+    static US: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    std::time::Duration::from_micros(*US.get_or_init(|| {
+        std::env::var("VICTORY_GUARD_SPIN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+    }))
+}
+
+/// The guards' lock, held. In diagnostics builds it notes how long, by
+/// where it was taken ([`holds`]): the waits for it are long (47 ms a frame
+/// of all threads' in run dith40), and who keeps the others waiting is not
+/// said by the waits.
+#[cfg(not(feature = "diagnostics"))]
+type Held = std::sync::MutexGuard<'static, Guards>;
+
+#[cfg(feature = "diagnostics")]
+struct Held(std::sync::MutexGuard<'static, Guards>, std::time::Instant, &'static std::panic::Location<'static>);
+
+#[cfg(feature = "diagnostics")]
+impl std::ops::Deref for Held {
+    type Target = Guards;
+    fn deref(&self) -> &Guards {
+        &self.0
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+impl std::ops::DerefMut for Held {
+    fn deref_mut(&mut self) -> &mut Guards {
+        &mut self.0
+    }
+}
+
+/// Holds of the guards' lock since the last line, by the line that took it:
+/// how many, nanoseconds in all, the longest.
+#[cfg(feature = "diagnostics")]
+static HOLDS: Mutex<Option<std::collections::HashMap<u32, (u64, u64, u64)>>> = Mutex::new(None);
+
+#[cfg(feature = "diagnostics")]
+impl Drop for Held {
+    fn drop(&mut self) {
+        let ns = self.1.elapsed().as_nanos() as u64;
+        ALL_HOLDS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ALL_HOLDS[1].fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+        if ns < 20_000 {
+            return;
+        }
+        let mut holds = HOLDS.lock().unwrap_or_else(|e| e.into_inner());
+        let e = holds.get_or_insert_with(Default::default).entry(self.2.line()).or_default();
+        (e.0, e.1, e.2) = (e.0 + 1, e.1 + ns, e.2.max(ns));
+    }
+}
+
+/// Every hold of the guards' lock since the last line: how many, nanoseconds.
+#[cfg(feature = "diagnostics")]
+static ALL_HOLDS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// [`HOLDS`] of 20 us and more, taken, for the log: per frame, the longest
+/// first, by watch.rs line.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn holds(frames: f64) -> String {
+    let taken = HOLDS.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+    let mut v: Vec<_> = taken.into_iter().collect();
+    v.sort_by(|a, b| b.1.1.cmp(&a.1.1));
+    let all = ALL_HOLDS.each_ref().map(|n| n.swap(0, std::sync::atomic::Ordering::Relaxed));
+    std::iter::once(format!("all {:.0} {:.2} ms", all[0] as f64 / frames, all[1] as f64 / 1e6 / frames))
+        .chain(v.iter()
+        .take(8)
+        .map(|(line, (n, ns, max))| format!("line {line}: {:.0} {:.2} ms (longest {:.2})", *n as f64 / frames, *ns as f64 / 1e6 / frames, *max as f64 / 1e6)))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The 4 KiB pages of title memory that what shaders wrote was put into,
@@ -2526,7 +2635,8 @@ fn allocation_end(at: usize, inside: usize) -> usize {
 
 /// Tells what keeps track of what title memory shows; the guards, with no
 /// block of the range known unmapped.
-fn title_memory_changed(at: usize, len: usize) -> std::sync::MutexGuard<'static, Guards> {
+#[track_caller]
+fn title_memory_changed(at: usize, len: usize) -> Held {
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);

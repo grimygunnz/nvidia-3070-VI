@@ -171,3 +171,33 @@ so a variable set in the shell never reaches it: pass settings with
   pattern, up to 40 % either way; 12 % was smoothed away by the title's filters before
   the coarse step) takes the bands away: sky in steps of 1-3, the room falling off
   evenly. Same frame time.
+
+## Evening of 2026-11-26: waits, spins, and device method 0x218
+
+Runs are now 200 s scored from 120 s (loading ends near 49 s, the cutscene about 30 s
+later, frame times settle by 130 s), one pair per change.
+
+- **Where the submitting thread waits** (a timeline at 240 s, `VICTORY_TIMELINE`): of
+  its time in submissions about a quarter is waiting: for the last refreshes of a
+  flush on the other threads (the long ones are waits for the guards' lock inside
+  `watch::writes`), and 4-5 ms a frame for the heaps' records at the end.
+- **The guards' lock** is held 8 ms a frame in all (about 1,800 holds of 6 us; the
+  longest, a write fault opening aliased blocks, up to 4 ms), yet threads waited
+  48-64 ms a frame for it: the time a thread put to sleep takes to run again. The
+  log's lock line now says who holds it, by `watch.rs` line, in diagnostics builds.
+  `VICTORY_GUARD_SPIN=<us>` spins before sleeping: 40 us halved the waits (23-27 ms)
+  and left the frame where it was (57.3/57.8 vs 57.4/57.6 ms). Off by default.
+- **Spinning helpers** of the copy threads (`VICTORY_WIDE_SPIN`, there already) and of
+  the landing, records and views pools (`VICTORY_POOL_SPIN`, new): 50 us 57.1/56.0 vs
+  57.9/57.1 ms, 200 us 57.6 vs 56.7 ms: noise. Both off by default.
+- **Device method 0x218** is the title's compute pipeline made of its own code: the
+  description's pieces are an FSPX part's entries (registers 0x1c bytes, hash 0x14,
+  code, metadata 0x403 with the code's dword count), and `VICTORY_RAW_COMPUTE=1` makes
+  them as an `ACCC` container the translator already reads. Off by default: once the
+  first succeed, the title makes all its compute pipelines that way and uses them in
+  place of the ones it makes of containers. 821 then do not translate (482 for FSPX
+  resources of root types not known yet; the rest for addresses not from a root
+  parameter, image stores of some channels, addresses of two computed terms, ...) and
+  their dispatches are dropped: 40 ms a frame, for a frame missing that work. Method
+  0x1c8 is the graphics counterpart (a 388-byte register block, an input layout of
+  POSITION, COLOR, TEXCOORD): not written.

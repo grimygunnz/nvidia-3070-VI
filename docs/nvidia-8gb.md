@@ -294,3 +294,10 @@ later, frame times settle by 130 s), one pair per change.
   parts) needs their ports 1-5 (`port`, `port_cbv`, `port_descriptors`) and was not
   brought. Also there, not tried: textures uploaded in a submission's prelude
   (5d6bd84, flicker), the light stand-in settling by time (9576c45), FSR 4 (AMD).
+- **The copies that copy.** Of copies over 64 MB (run big), finding what to take is
+  0.13 ms a frame and taking it 2.2 ms for 12.6 MB. The one costliest beside the heap
+  is a 21 MB buffer in the card's memory at a process-heap address (not the title's
+  xmem, so not write-watched): the card writes all of it each frame, it is fetched
+  into title memory (21 MB in 322 pieces), and the next refresh copies it whole and
+  sends all of it up again (2.9 ms a frame). `VICTORY_SEND_CHANGED=1` (compare, send
+  the dwords that changed) would send nothing of it after a landing; not measured yet.

@@ -7603,6 +7603,11 @@ fn split_line(frames: f64) {
             "refreshes of big flushes per frame: {:.0} looks known to copy nothing taking {:.2} ms (all threads), the big flushes {:.2} ms from first to last",
             n[0], n[1] / 1e6, n[2] / 1e6
         );
+        let b: Vec<f64> = crate::shadow::BIG_NS.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        tracing::info!(
+            "refreshes of copies over 64 MB per frame: {:.1}, {:.2} ms finding what to take ({:.0} written pages given), {:.2} ms taking {:.2} MB",
+            b[3], b[0] / 1e6, b[4], b[1] / 1e6, b[2] / 1e6
+        );
         let l: Vec<f64> = crate::shadow::LOOK_NS.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         tracing::info!(
             "looks whether a refresh copies nothing per frame: {:.0}, over {:.0} pages; {:.2} ms the pending ranges, {:.2} ms the copy's notes, {:.2} ms the journal",

@@ -3904,6 +3904,8 @@ impl Shadow {
     /// (`written`: last writes by page, in page order; `now`: this
     /// asking), whole pages within the buffer.
     fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
+        let big = self.len > 64 << 20;
+        let t0 = std::time::Instant::now();
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
@@ -3955,7 +3957,15 @@ impl Shadow {
             runs.push(((first * PAGE).max(from), ((last + 1) * PAGE).min(to), known));
         }
         let runs = by_parts(runs, &again_at, &crate::watch::parts_written(&again_at));
+        let t1 = std::time::Instant::now();
         let bytes = self.take_all(runs);
+        if big {
+            BIG_NS[0].fetch_add((t1 - t0).as_nanos() as u64, Ordering::Relaxed);
+            BIG_NS[1].fetch_add(t1.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            BIG_NS[2].fetch_add(bytes as u64, Ordering::Relaxed);
+            BIG_NS[3].fetch_add(1, Ordering::Relaxed);
+            BIG_NS[4].fetch_add(written.len() as u64, Ordering::Relaxed);
+        }
         if crate::watch::light() {
             // All of the range is in the copy as of this asking.
             let mut ranged = self.ranged.lock().unwrap_or_else(|e| e.into_inner());
@@ -5657,3 +5667,8 @@ pub(crate) fn near(va: u64) -> String {
 /// in its parts (the pending ranges' lock, the copy's notes and its ranged
 /// note, the journal's look), the looks, and the pages they covered.
 pub(crate) static LOOK_NS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// Diagnostics, since the last frame line, for copies over 64 MB: nanoseconds
+/// in [`Shadow::copy_stale`] finding what to take, nanoseconds taking it,
+/// bytes taken, refreshes, and written pages the journal gave them.
+pub(crate) static BIG_NS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];

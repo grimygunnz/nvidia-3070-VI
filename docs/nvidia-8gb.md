@@ -92,3 +92,28 @@ gameplay frame ended in a timeout reset of the driver (event 153), with or witho
 2. Series X on 8 GB: a cap on textures' share of the card (`VICTORY_TEXTURE_BUDGET_MB`)
    so the render targets fit.
 3. The replay on 8 GB cards, to see the card's time by pass.
+
+## One core die (2026-11-26)
+
+The Ryzen 9 5900X has two core dies, each with its own 32 MB L3. At the start of a run
+the process now keeps to the logical processors of the first last-level cache, where
+there are several and it serves at least 12 (`cores::keep_on_one_l3`;
+`VICTORY_ONE_L3=0`: all). `scripts/play-guarded.ps1 -Affinity <mask>` does the same from
+outside.
+
+| | Runs | Mean |
+|---|---|---|
+| All processors | 65.5, 63.7 ms | 64.6 ms |
+| The first die (launcher's mask, then the built-in) | 60.2, 60.8, 66.6 ms | 62.5 ms |
+
+About 2 ms, within the runs' spread: kept as likely, not proven. On this PC frames
+vary by some ±4 ms between runs of the same build (other programs ran meanwhile); a
+change of a few ms needs several runs on each side.
+
+Also tried in this round, each one run: heap-sync rounds every 1 ms instead of 4
+(`VICTORY_HEAP_SYNC_EARLY=1`, 68.7 ms) and up to 16 submission parts joined
+(`VICTORY_JOIN_PARTS=16`, 72.7 ms, no more joined than with 8). Not kept.
+
+Ray tracing does not run: without `VICTORY_BVH_BUILDER=1` every stage of the structure
+builder is dropped and the ray resolve and activation passes are left out; there is no
+ray-tracing work of the card's to take away.

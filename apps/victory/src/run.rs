@@ -49,6 +49,9 @@ pub fn run(
 
     if execute {
         check_cpu_features()?;
+        // Before the title's threads are made (`VICTORY_ONE_L3`).
+        #[cfg(windows)]
+        victory_hle::keep_on_one_l3();
     }
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();

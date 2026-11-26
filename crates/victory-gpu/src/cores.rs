@@ -31,6 +31,57 @@ fn cpu_sets() -> Vec<(u32, u8)> {
     sets
 }
 
+/// Keeps the whole process on the logical processors of one last-level
+/// cache, where the processor has several and the first serves at least 12
+/// (a Ryzen with two core dies: 6 cores, 12 threads, 32 MiB each). Called at
+/// the start of a run, before the title's threads are made.
+/// `VICTORY_ONE_L3=0`: every processor, as before.
+///
+/// Why: the submitting thread, its helpers, the relay and the title's threads
+/// share the tracking of title memory; spread over both dies of a Ryzen 9
+/// 5900X they passed it between two caches. On the first die only the
+/// opening's gameplay went from 65.5 and 63.7 to 60.2 and 60.8 ms a frame
+/// (2026-11-26, RTX 3070 Ti, Series S).
+pub fn keep_on_one_l3() {
+    use windows_sys::Win32::System::SystemInformation::{GetSystemCpuSetInformation, SYSTEM_CPU_SET_INFORMATION};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, SetProcessAffinityMask};
+    if std::env::var_os("VICTORY_ONE_L3").is_some_and(|v| v == "0") {
+        return;
+    }
+    let mut bytes = 0u32;
+    // SAFETY: a size query, then the call into a buffer of that size.
+    unsafe { GetSystemCpuSetInformation(std::ptr::null_mut(), 0, &mut bytes, GetCurrentProcess(), 0) };
+    let mut buffer = vec![0u64; (bytes as usize).div_ceil(8).max(1)];
+    // SAFETY: as above; the buffer holds `bytes` bytes, aligned for the records.
+    let ok = unsafe { GetSystemCpuSetInformation(buffer.as_mut_ptr().cast(), bytes, &mut bytes, GetCurrentProcess(), 0) };
+    // Last-level cache -> mask of its logical processors (group 0).
+    let mut caches: std::collections::BTreeMap<u8, usize> = std::collections::BTreeMap::new();
+    let mut at = 0usize;
+    while ok != 0 && at + size_of::<SYSTEM_CPU_SET_INFORMATION>() <= bytes as usize {
+        // SAFETY: a record inside the buffer; each says its own size.
+        let info = unsafe { &*(buffer.as_ptr().cast::<u8>().add(at).cast::<SYSTEM_CPU_SET_INFORMATION>()) };
+        if info.Size == 0 {
+            break;
+        }
+        // SAFETY: the record's type is CpuSet (the only one there is).
+        let set = unsafe { &info.Anonymous.CpuSet };
+        if set.Group == 0 && u32::from(set.LogicalProcessorIndex) < usize::BITS {
+            *caches.entry(set.LastLevelCacheIndex).or_default() |= 1usize << set.LogicalProcessorIndex;
+        }
+        at += info.Size as usize;
+    }
+    let Some((&cache, &mask)) = caches.iter().next() else {
+        return;
+    };
+    if caches.len() < 2 || mask.count_ones() < 12 {
+        return;
+    }
+    // SAFETY: our own process, a mask of processors it has.
+    if unsafe { SetProcessAffinityMask(GetCurrentProcess(), mask) } != 0 {
+        tracing::info!(cache, mask = format_args!("{mask:#x}"), caches = caches.len(), "the process is kept on the processors of one last-level cache (VICTORY_ONE_L3=0: all)");
+    }
+}
+
 /// The sets of the fastest class, if there are slower ones too.
 fn fast_of(sets: &[(u32, u8)]) -> Vec<u32> {
     let best = sets.iter().map(|c| c.1).max().unwrap_or(0);

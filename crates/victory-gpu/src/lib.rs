@@ -28,6 +28,8 @@ mod copystat;
 mod faultbook;
 #[cfg(windows)]
 mod cores;
+#[cfg(windows)]
+pub use cores::keep_on_one_l3;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]

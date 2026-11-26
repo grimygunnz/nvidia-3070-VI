@@ -2,7 +2,7 @@
 #  - a Windows job object caps the game's committed memory (-MaxGB, 46 by default);
 #  - a watchdog ends the game below -MinFreeGB of free physical memory (3);
 #  - every 5 s the game's private memory, free memory and card memory go to <log>.mem.csv.
-#   scripts\play-guarded.ps1 -Game <exe> -SkipMenus -Seconds 330 -Tag x [-Console series-s]
+#   scripts\play-guarded.ps1 -Game <exe> -SkipMenus -Seconds 330 -Tag x [-Console series-s] [-Affinity 0xFFF]
 param(
     [Parameter(Mandatory)][string]$Game,
     [string]$Exe = (Join-Path $PSScriptRoot "..\target\diag\victory.exe"),
@@ -13,7 +13,10 @@ param(
     [double]$MinFreeGB = 3,
     [switch]$SkipMenus,
     [int]$Seconds = 0,
-    [string]$Tag = ""
+    [string]$Tag = "",
+    # Logical processors the game may run on, as a bit mask (0: all). On a
+    # Ryzen with two core dies, 0xFFF keeps it on the first die's 12 threads.
+    [long]$Affinity = 0
 )
 $ErrorActionPreference = 'Stop'
 Add-Type -TypeDefinition @'
@@ -69,6 +72,7 @@ try {
     $p = Start-Process -FilePath $Exe -ArgumentList @('run', $Game, '--execute', '--console', $Console) -NoNewWindow -PassThru `
         -RedirectStandardOutput $log -RedirectStandardError "$log.err"
     $null = [GuardJob]::Cap($p.Handle, [uint64]$MaxGB * 1GB)
+    if ($Affinity -ne 0) { $p.ProcessorAffinity = [IntPtr]$Affinity; Write-Host ("Affinity: 0x{0:X}" -f $Affinity) }
     'seconds,private_gb,free_gb,card_gb' | Set-Content -Encoding utf8 $csv
     $start = Get-Date
     $why = $null

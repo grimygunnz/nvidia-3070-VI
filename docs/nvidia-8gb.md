@@ -226,3 +226,18 @@ later, frame times settle by 130 s), one pair per change.
   something is nearly always in the air. Moving the refreshes off that thread needs
   the flights' bookkeeping to say, per range, what is still to land, from before the
   lists are sent.
+- **Refreshes ahead, second try, also taken out.** The ranges a submission may write
+  were put in a record from the start of its preparation (before any refresh or
+  snapshot of it) until the line noted them, under a lock that a refresh ahead held
+  from its look to the end of its refresh; copies in the card's memory were left to
+  the submission. The title still crashed at the cutscene's start (frame ~1265, a
+  write to null in its code, `+0x23cf683` or `+0x2215c35`), with the refreshes on
+  their own thread, and also with the pass not refreshing at all (`nothing_new` and
+  the checks alone), and with only the checks of what is in the air. A pass that
+  only counts the list's steps ran clean, as did the record on the submitting thread
+  alone, and every run without the pass. Nothing the crashing passes did writes
+  anything the title or the card read; they took locks (a copy's pending writes, the
+  line's, the record's) in the moments the title's first cutscene frames come
+  together. The title has something there that depends on when the flights land, and
+  finding it means following its code at that address. Until then the submitting
+  thread keeps the refreshes.

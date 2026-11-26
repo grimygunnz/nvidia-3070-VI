@@ -29,11 +29,16 @@ if not defined VICTORY_INDIRECT_BATCH set "VICTORY_INDIRECT_BATCH=2"
 if not defined VICTORY_MAP_THREADS set "VICTORY_MAP_THREADS=1"
 if not defined VICTORY_CARD_AWAKE set "VICTORY_CARD_AWAKE=1"
 if not defined VICTORY_SHOW_AFTER set "VICTORY_SHOW_AFTER=1"
-if not defined VICTORY_AMBIENT set "VICTORY_AMBIENT=0.8"
+rem The game's own light: its ray resolve runs with no structure (every ray misses: lamps and sky unshadowed)
+if not defined VICTORY_AMBIENT set "VICTORY_AMBIENT=0"
+if not defined VICTORY_RT_RESOLVE set "VICTORY_RT_RESOLVE=1"
+if not defined VICTORY_ACTIVATE_RAYS set "VICTORY_ACTIVATE_RAYS=1"
 if not defined VICTORY_THIN set "VICTORY_THIN=1"
 if not defined VICTORY_JOIN_PARTS set "VICTORY_JOIN_PARTS=8"
 if not defined VICTORY_UPLOAD_AHEAD set "VICTORY_UPLOAD_AHEAD=1"
-if not defined VICTORY_LEVELS_ON_DEMAND set "VICTORY_LEVELS_ON_DEMAND=1"
+rem 8 GB: host copies of textures from the levels shown, none above 1024 a side
+if not defined VICTORY_LEVELS_ON_DEMAND set "VICTORY_LEVELS_ON_DEMAND=0"
+if not defined VICTORY_TEXTURE_MAX_SIDE set "VICTORY_TEXTURE_MAX_SIDE=1024"
 if not defined VICTORY_CARD_BUFFERS_MIN_KB set "VICTORY_CARD_BUFFERS_MIN_KB=64"
 if not defined VICTORY_LOG if not defined RUST_LOG set "VICTORY_LOG=warn"
 "%runner%" run "%VICTORY_GAME_DIR%\game_scarlett_master.exe" --console series-s --execute

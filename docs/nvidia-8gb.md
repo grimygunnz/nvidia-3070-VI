@@ -322,3 +322,13 @@ later, frame times settle by 130 s), one pair per change.
   estimate itself is near nothing on walls; `VICTORY_AMBIENT=constant:1.0` with
   `AMBIENT_MOST=0` lights everything evenly, without bands but flat. The grain on the
   estimate now moves every frame (the frame number in the spare constant).
+- **The lamps' light: the ray resolve run with no structure.** `CS_RaytracingResolve`
+  (~1,000 programs) was left out without the BVH ("shades no hits"), and so was
+  `CS_ScreenProbes_ActivateRays`. With no structure every ray misses, and a miss is
+  what lights: the lamps unshadowed, the sky seen. Left out, what they write stayed
+  empty: the lamps' light fully shadowed, rooms black but for the sun, the exposure
+  pushed up until the stand-in's light showed in patches. With `VICTORY_RT_RESOLVE=1
+  VICTORY_ACTIVATE_RAYS=1` (and the stand-in off, the texture cap on; run rres) the
+  prison is lit as it should be, no bands, at 68-75 ms a frame against 60-63. The
+  launchers (`Play-VIctory.cmd`, `scripts/play-guarded.ps1`) now set: AMBIENT=0,
+  RT_RESOLVE=1, ACTIVATE_RAYS=1, LEVELS_ON_DEMAND=0, TEXTURE_MAX_SIDE=1024.

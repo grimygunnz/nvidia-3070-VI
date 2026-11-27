@@ -967,12 +967,16 @@ pub(crate) fn relay() -> bool {
 
 /// The submission being prepared (its number among those started): what
 /// [`Shadow::writing`] counts a declared range for ([`Flights`]).
-static PREPARED: AtomicU64 = AtomicU64::new(0);
+thread_local! {
+    /// (Per thread: with `VICTORY_PIPELINE` the card's side of one submission
+    /// is done on a thread of its own while the next is prepared.)
+    static PREPARED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 /// A submission's preparing begins (`crate::host`, under the submission
 /// lock).
 pub(crate) fn preparing(number: u64) {
-    PREPARED.store(number, Ordering::Relaxed);
+    PREPARED.set(number);
 }
 
 /// With [`relay`]: the number of the last send of changed ranges to the
@@ -3080,7 +3084,7 @@ impl Shadow {
         // With the copy-back on its own thread: counted for this submission
         // (once), whether or not an earlier one still holds the range.
         if relay() {
-            self.flights.lock().unwrap_or_else(|e| e.into_inner()).declare(range, PREPARED.load(Ordering::Relaxed));
+            self.flights.lock().unwrap_or_else(|e| e.into_inner()).declare(range, PREPARED.get());
         }
         // Dispatches declare the same ranges thousands of times.
         if pending.contains(&range) {

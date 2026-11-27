@@ -60,3 +60,31 @@ overlapped the submitting side is the longer of them, some 31 ms, not 47.
    `send_late`. Presents and the present-time settles go through the same queue.
 4. Runs: crashes, hangs (stack dumps with registers, `VICTORY_STACKS`), the
    picture at 170 s and 250 s, and the frame time against the switch off.
+
+## Where it stands (2026-11-26, late)
+
+Steps 1-3 are in, behind `VICTORY_PIPELINE=1` (off by default): `Host::prepare` (A) and
+`Host::finish` (B); the submission being prepared per thread (`shadow::preparing`); the
+submissions handed to the sender (`PENDING`, what they may write and whether steps of
+them go to the card) counted as in the air by `flying`; A waits for the sender first
+where it would block (`pending_blocks`) and before its waits for landings
+(`DRAIN_FIRST`, only where the submission lock is not held: the first run hung with a
+settle at a present holding the lock and waiting for the sender, which waited for the
+lock); signals behind what is handed on go through the sender; presents and the
+queue's drain wait for it; the writes of views picked by index are declared at A's end
+when pipelined. Runs:
+
+- No hang, no crash (pipe2, pipe4), the frame no shorter: 56.3-57.6 ms against
+  55.5-57.4 with it off.
+- Of 17.5 submissions a frame handed to the sender, about 10 wait for it first, 7 of
+  those because the one it holds has steps done on the card (`pending_blocks` turns
+  every such one down): only about 7 a frame overlap.
+- The picture has bands with it on (walls, the window) that it does not have off: some
+  order of the light's data is still not kept. Found and fixed one (the writes of views
+  picked by index were declared after the next submission's refreshes could begin);
+  the bands stayed.
+
+Next: what of the card's steps of a submission handed on the next one really meets
+(its copies, as `card_steps::copied_read` looks at the line's), not all of them; and
+the light data's order (which copies the bands are in, with the line's and the
+sender's numbers).

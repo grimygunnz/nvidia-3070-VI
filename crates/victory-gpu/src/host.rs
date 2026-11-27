@@ -2626,10 +2626,147 @@ type Declared = (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>);
 
 /// What [`Host::submit`] hands back for a submission it sent and did not
 /// wait for.
+/// Whether a submission's card's side is done on a thread of its own, one
+/// submission behind its CPU side (`VICTORY_PIPELINE=1`, off by default;
+/// with the relay only). `docs/pipeline.md`.
+pub(crate) fn pipeline() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE").is_some_and(|v| v == "1") && late() && relay() && relay_exact())
+}
+
+thread_local! {
+    /// This is the sender thread ([`pipeline`]).
+    static ON_SENDER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// This thread prepares a submission without the submission lock: a wait
+    /// for landings ([`relay_wait`]) waits for the sender first.
+    static DRAIN_FIRST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A submission handed to the sender and not yet noted by the line: what it
+/// may write (title memory) and whether steps of it are done on the card.
+struct Pending {
+    number: u64,
+    written: Vec<(usize, usize)>,
+    own: bool,
+}
+
+static PENDING: Mutex<Vec<Pending>> = Mutex::new(Vec::new());
+
+/// Since the last frame line: submissions handed to the sender, those whose
+/// CPU side waited for it first (they meet what it has), and of those, the
+/// ones it had steps done on the card for.
+pub(crate) static PIPE_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// What the sender does, in order.
+enum Item {
+    Send { lists: Vec<crate::list::Detached>, order: Vec<usize>, parts: Vec<usize>, prepared: Prepared<'static>, number: u64 },
+    Signal(usize, u64),
+}
+
+// SAFETY: D3D12 objects are free-threaded; an item is touched by the thread
+// that made it and then by the sender alone.
+unsafe impl Send for Item {}
+
+/// Items given to the sender and not done yet.
+static SENDER_QUEUED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static SENDER_IDLE: (Mutex<()>, std::sync::Condvar) = (Mutex::new(()), std::sync::Condvar::new());
+
+fn to_sender(item: Item) {
+    static SEND: OnceLock<Mutex<std::sync::mpsc::Sender<Item>>> = OnceLock::new();
+    let send = SEND.get_or_init(|| {
+        let (send, items) = std::sync::mpsc::channel::<Item>();
+        std::thread::Builder::new()
+            .name("victory-sender".into())
+            .spawn(move || {
+                crate::cores::keep_on_fast_cores("victory-sender");
+                ON_SENDER.set(true);
+                for item in items {
+                    let _span = crate::timeline::span("the sender: a submission's card side");
+                    let Some(host) = host() else { continue };
+                    match item {
+                        Item::Send { lists, order, parts, prepared, number } => {
+                            let _ = parts;
+                            let sent = {
+                                let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
+                                host.finish(&runs, prepared)
+                            };
+                            host.after_sent(lists, order, sent, Some(number));
+                        }
+                        Item::Signal(fence, value) => {
+                            if !late_signal(fence, value) {
+                                crate::fence::set(fence as crate::object::This, value);
+                            }
+                        }
+                    }
+                    let _idle = SENDER_IDLE.0.lock().unwrap_or_else(|e| e.into_inner());
+                    SENDER_QUEUED.fetch_sub(1, Ordering::AcqRel);
+                    SENDER_IDLE.1.notify_all();
+                }
+            })
+            .expect("the sender thread");
+        Mutex::new(send)
+    });
+    SENDER_QUEUED.fetch_add(1, Ordering::AcqRel);
+    let _ = send.lock().unwrap_or_else(|e| e.into_inner()).send(item);
+}
+
+/// Waits until the sender has done everything given to it (not on the
+/// sender itself; nothing without [`pipeline`]).
+pub(crate) fn drain_sender() {
+    if !pipeline() || ON_SENDER.get() || SENDER_QUEUED.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let _span = crate::timeline::span("waiting for the sender");
+    let mut idle = SENDER_IDLE.0.lock().unwrap_or_else(|e| e.into_inner());
+    while SENDER_QUEUED.load(Ordering::Acquire) > 0 {
+        idle = SENDER_IDLE.1.wait(idle).unwrap_or_else(|e| e.into_inner());
+    }
+}
+
+/// `runs` handed to the sender as `number`: what they may write.
+fn pend(number: u64, runs: &[&HostList], own: bool) {
+    let mut written: Vec<(usize, usize)> = declared_writes(runs).into_iter().flat_map(|(_, r)| r).collect();
+    written.extend(crate::picked::peek(runs));
+    for list in runs {
+        let deferred = list.deferred();
+        written.extend(deferred.texture_backs.iter().map(crate::texback::Back::range));
+        written.extend(deferred.writes.iter().map(|&(at, _, bytes)| (at, at + bytes.max(1))));
+    }
+    let mut joined = Vec::new();
+    join_ranges(&mut joined, written);
+    PENDING.lock().unwrap_or_else(|e| e.into_inner()).push(Pending { number, written: joined, own });
+}
+
+/// The line has noted submission `number`.
+fn unpend(number: u64) {
+    PENDING.lock().unwrap_or_else(|e| e.into_inner()).retain(|p| p.number != number);
+    LINE_LANDED.notify_all();
+    LINE_MOVED.notify_all();
+}
+
+/// Whether what `runs` read or write meets what a submission handed to the
+/// sender may write, or such a submission has steps done on the card.
+fn pending_blocks(runs: &[&HostList]) -> bool {
+    let pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    if pending.is_empty() {
+        return false;
+    }
+    if pending.iter().any(|p| p.own) {
+        return true;
+    }
+    let mut all = Vec::new();
+    join_ranges(&mut all, pending.iter().flat_map(|p| p.written.iter().copied()));
+    drop(pending);
+    blocked_by(&all, runs, false).is_some()
+}
+
 /// A submission prepared on the CPU's side (stage A, `docs/pipeline.md`):
 /// what its card's side ([`Host::finish`]) takes over.
 struct Prepared<'a> {
-    submitted: std::sync::MutexGuard<'a, u64>,
+    /// What shaders may write through views they pick, declared by the CPU
+    /// side when pipelined.
+    picked: Option<crate::picked::Ranges>,
+    submitted: Option<std::sync::MutexGuard<'a, u64>>,
     parts: Vec<usize>,
     late: bool,
     own: Option<card_steps::Taken>,
@@ -2786,6 +2923,9 @@ fn join_ranges(ranges: &mut Vec<(usize, usize)>, more: impl IntoIterator<Item = 
 fn flying() -> bool {
     if !late() {
         return false;
+    }
+    if pipeline() && !PENDING.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+        return true;
     }
     let line = line();
     // (With the relay: also while flights are being landed.)
@@ -3182,6 +3322,10 @@ pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
     if !late() {
         return false;
     }
+    if pipeline() && !ON_SENDER.get() && SENDER_QUEUED.load(Ordering::Acquire) > 0 {
+        to_sender(Item::Signal(fence, value));
+        return true;
+    }
     let mut line = line();
     if line.line.is_empty() && !line.settling {
         return false;
@@ -3255,6 +3399,8 @@ pub(crate) fn settle_now(why: usize) {
     let Some(host) = host() else {
         return;
     };
+    // (Before the lock, which the sender takes for what it has.)
+    drain_sender();
     let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
     host.settle(&mut submitted, why);
 }
@@ -3373,6 +3519,10 @@ fn late_threads() {
 /// as waiting for the card. The caller may hold the submission lock: the
 /// thread that lands flights never takes it.
 fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
+    // (Only where the submission lock is not held: the sender takes it.)
+    if DRAIN_FIRST.get() {
+        drain_sender();
+    }
     let mut line = line();
     if done(&line) {
         return;
@@ -5206,11 +5356,45 @@ impl Host {
     }
 
     fn send_late(&self, lists: Vec<crate::list::Detached>, order: Vec<usize>, parts: &[usize]) {
+        if pipeline() && !ON_SENDER.get() {
+            let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
+            // (What a submission handed on blocks: before anything of this
+            // one looks at what is in the air.)
+            PIPE_STATS[0].fetch_add(1, Ordering::Relaxed);
+            if pending_blocks(&runs) {
+                PIPE_STATS[1].fetch_add(1, Ordering::Relaxed);
+                if PENDING.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|p| p.own) {
+                    PIPE_STATS[2].fetch_add(1, Ordering::Relaxed);
+                }
+                drain_sender();
+            }
+            DRAIN_FIRST.set(true);
+            let prepared = self.prepare(&runs, parts, true, true);
+            DRAIN_FIRST.set(false);
+            let number = prepared.this_submission;
+            pend(number, &runs, prepared.own.is_some());
+            drop(runs);
+            // SAFETY: the host lives as long as the process; the prepared
+            // submission holds no guard of the submission lock (`pipelined`).
+            let prepared: Prepared<'static> = unsafe { std::mem::transmute(prepared) };
+            to_sender(Item::Send { lists, order, parts: parts.to_vec(), prepared, number });
+            return;
+        }
         let sent = {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
             self.submit(&runs, parts, true)
         };
+        self.after_sent(lists, order, sent, None);
+    }
+
+    /// The rest of [`Host::send_late`] once the submission is sent: the line
+    /// notes it, and settles if it must. `pending`: the number it stood under
+    /// in [`PENDING`], taken out once the line has it.
+    fn after_sent<'a>(&'a self, lists: Vec<crate::list::Detached>, order: Vec<usize>, sent: Option<(std::sync::MutexGuard<'a, u64>, Sent)>, pending: Option<u64>) {
         let Some((mut submitted, sent)) = sent else {
+            if let Some(number) = pending {
+                unpend(number);
+            }
             // (Not reached: a submission sent ahead always comes back.)
             crate::list::recycle(lists, &order);
             return;
@@ -5242,6 +5426,10 @@ impl Host {
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
             *flying >= late_most()
         };
+        // Noted in the line: no longer handed on (after the line's lock).
+        if let Some(number) = pending {
+            unpend(number);
+        }
         LATE_STATS[0].fetch_add(1, Ordering::Relaxed);
         RELAY_MOVED.notify_one();
         if told && !late_writes() {
@@ -5505,7 +5693,16 @@ impl Host {
     /// ([`joins`]): those go to the queue in calls of their own, one after the
     /// other, as they would have.
     fn submit<'a>(&'a self, runs: &[&HostList], parts: &[usize], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
-        let given = runs;
+        // (Behind what the sender still has: the queue's order.)
+        drain_sender();
+        let prepared = self.prepare(runs, parts, late, false);
+        self.finish(runs, prepared)
+    }
+
+    /// The CPU's side of a submission (stage A, `docs/pipeline.md`).
+    /// `pipelined`: without the submission lock, which the card's side takes
+    /// on the sender thread ([`pipeline`]); its settles only wait (the relay).
+    fn prepare<'a>(&'a self, runs: &[&HostList], parts: &[usize], late: bool, pipelined: bool) -> Prepared<'a> {
         #[cfg(feature = "diagnostics")]
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -5515,7 +5712,8 @@ impl Host {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut stage = crate::timeline::span("submit: the submission lock");
-        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let mut holder = (!pipelined).then(|| self.submitted.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut unlocked = 0u64;
         let was_working = working(true);
         submitting(1, runs.len());
         #[cfg(feature = "diagnostics")]
@@ -5532,7 +5730,7 @@ impl Host {
         ahead.part(12);
         stage.next("submit: waiting for flights it reads from");
         if !late {
-            self.settle(&mut submitted, WHY_SYNC);
+            self.settle(holder.as_deref_mut().unwrap_or(&mut unlocked), WHY_SYNC);
         } else if own.is_none()
             && let Some(why) = late_blocked(runs)
         {
@@ -5543,7 +5741,7 @@ impl Host {
                     blocked_by(&line.written, runs, false).is_none() && !card_steps::copied_read(&card_steps::copies(line), runs)
                 });
             } else {
-                self.settle(&mut submitted, why);
+                self.settle(holder.as_deref_mut().unwrap_or(&mut unlocked), why);
             }
         }
         #[cfg(feature = "diagnostics")]
@@ -5577,7 +5775,7 @@ impl Host {
         } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {
             // With the present sent ahead nothing else brings a moment
             // with nothing in the air: one is made for the sweep.
-            self.settle(&mut submitted, WHY_SYNC);
+            self.settle(holder.as_deref_mut().unwrap_or(&mut unlocked), WHY_SYNC);
             if upcheck::on() {
                 upcheck::at_rest(self);
             }
@@ -5643,12 +5841,12 @@ impl Host {
             let stale = if behind { stale_under_flights(runs) } else { Vec::new() };
             if !stale.is_empty() {
                 let settling = std::time::Instant::now();
-                self.settle_stale(&mut submitted, runs, stale, &ranges);
+                self.settle_stale(holder.as_deref_mut().unwrap_or(&mut unlocked), runs, stale, &ranges);
                 settled += settling.elapsed();
             }
         } else if behind && !stale_under_flights(runs).is_empty() {
             let settling = std::time::Instant::now();
-            self.settle(&mut submitted, WHY_STALE);
+            self.settle(holder.as_deref_mut().unwrap_or(&mut unlocked), WHY_STALE);
             settled += settling.elapsed();
         }
         #[cfg(feature = "diagnostics")]
@@ -5689,8 +5887,19 @@ impl Host {
         }
         #[cfg(feature = "diagnostics")]
         split.part(3);
+        // What shaders may write through views they pick: last, so that no
+        // refresh of this submission leaves it alone; here, before the next
+        // submission's refreshes may begin (`VICTORY_PIPELINE`).
+        let picked = pipelined.then(|| {
+            let picked = crate::picked::declare(runs);
+            for (shadow, at, len) in &picked.written {
+                shadow.writing(*at, *len);
+            }
+            picked
+        });
         let prepared = Prepared {
-            submitted,
+            picked,
+            submitted: holder,
             parts,
             late,
             own,
@@ -5710,7 +5919,7 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             split,
         };
-        self.finish(given, prepared)
+        prepared
     }
 
     /// The card's side of a submission [`Host::submit`] prepared (stage B,
@@ -5718,7 +5927,8 @@ impl Host {
     /// index, the heaps' records, sending.
     fn finish<'a>(&'a self, given: &[&HostList], prepared: Prepared<'a>) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
         let Prepared {
-            mut submitted,
+            picked,
+            submitted,
             parts,
             late,
             own,
@@ -5740,6 +5950,9 @@ impl Host {
         } = prepared;
         #[cfg(feature = "diagnostics")]
         let _ = called;
+        let mut submitted = submitted.unwrap_or_else(|| self.submitted.lock().unwrap_or_else(|e| e.into_inner()));
+        // (On the sender thread: what it declares counts for this one.)
+        crate::shadow::preparing(this_submission);
         // The submission's lists, the list of the steps taken for the card
         // first (as `submit` has them).
         let with: Vec<&HostList>;
@@ -5760,12 +5973,14 @@ impl Host {
             self.settle(&mut submitted, WHY_MOST);
             settled += settling.elapsed();
         }
-        // What shaders may write through views they pick: last, so that no
-        // refresh of this submission leaves it alone.
-        let picked = crate::picked::declare(runs);
-        for (shadow, at, len) in &picked.written {
-            shadow.writing(*at, *len);
-        }
+        // (Declared here, last, unless the CPU side did: `VICTORY_PIPELINE`.)
+        let picked = picked.unwrap_or_else(|| {
+            let picked = crate::picked::declare(runs);
+            for (shadow, at, len) in &picked.written {
+                shadow.writing(*at, *len);
+            }
+            picked
+        });
         let declared = declared_writes(runs);
         let card = self.card_before(&declared, &picked, flown);
         // The sends are taken: from here on the references hold what the
@@ -7692,6 +7907,13 @@ impl Split {
 /// The split of the preparing, per frame, for the frame-rate line.
 #[cfg(feature = "diagnostics")]
 fn split_line(frames: f64) {
+    if pipeline() {
+        let p: Vec<f64> = PIPE_STATS.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        tracing::info!(
+            "the pipeline per frame (VICTORY_PIPELINE): {:.1} submissions handed to the sender, {:.1} of them waited for it first ({:.1} for its steps on the card)",
+            p[0], p[1], p[2]
+        );
+    }
     {
         let n: Vec<f64> = NOTHING_NEW.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         tracing::info!(

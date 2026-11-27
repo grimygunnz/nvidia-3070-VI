@@ -294,6 +294,20 @@ pub(crate) fn declare(runs: &[&HostList]) -> Ranges {
     Ranges { written: of(written, 0), looked: of(looked, 1) }
 }
 
+/// The title memory (from, to) that [`declare`] would say shaders of `runs`
+/// may write through views they pick, without its turn of what is looked at
+/// (`crate::host`'s record of submissions handed to the sender).
+pub(crate) fn peek(runs: &[&crate::host::HostList]) -> Vec<(usize, usize)> {
+    if !on() || !runs.iter().any(|list| list.used(KEY)) {
+        return Vec::new();
+    }
+    let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(state) = state.as_ref() else {
+        return Vec::new();
+    };
+    state.found.iter().filter_map(|id| state.shown.get(id).map(|s| (s.from as usize, s.to as usize))).collect()
+}
+
 /// The compare found a piece changed (it begins at offset `at` of `copy`)
 /// where it only looked: something wrote it through a view nobody declared.
 pub(crate) fn found(copy: &Arc<Shadow>, at: usize) {

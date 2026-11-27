@@ -574,6 +574,8 @@ impl Work for Job {
                 }
             }
             Job::Present(texture, overlay, shown) => {
+                // (Behind every submission handed to the sender.)
+                crate::host::drain_sender();
                 if let Some((texture, state)) = texture {
                     // (Where its lists were not translated when the title
                     // presented: the state they left it in.)
@@ -726,6 +728,8 @@ pub(super) fn drain() {
     }
     let began = Instant::now();
     LANE.drain();
+    // (And what the line handed to the sender: done when it is sent.)
+    crate::host::drain_sender();
     STATS[DRAINING].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
     STATS[DRAINS].fetch_add(1, Relaxed);
 }

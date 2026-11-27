@@ -127,11 +127,18 @@ pub(super) enum FillTo {
 /// Title memory something in the air writes: the host copy it goes through
 /// (`None`: none, the bytes reach title memory when the flight lands), from,
 /// to, and whether it is the destination of a copy done here.
+#[derive(Clone)]
 pub(super) struct Writer {
     shadow: Option<Arc<Shadow>>,
     from: usize,
     to: usize,
     copy: bool,
+}
+
+impl Writer {
+    pub(super) fn range(&self) -> (usize, usize) {
+        (self.from, self.to)
+    }
 }
 
 /// What `items` of the line write.
@@ -634,7 +641,7 @@ impl Taken {
         self.steps.contains(&(std::ptr::from_ref(list) as usize, i))
     }
 
-    fn copied(&self) -> impl Iterator<Item = Writer> {
+    pub(super) fn copied(&self) -> impl Iterator<Item = Writer> {
         self.copied.iter().map(|(shadow, from, to)| Writer {
             shadow: Some(shadow.clone()),
             from: *from,

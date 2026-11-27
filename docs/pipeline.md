@@ -88,3 +88,19 @@ Next: what of the card's steps of a submission handed on the next one really mee
 (its copies, as `card_steps::copied_read` looks at the line's), not all of them; and
 the light data's order (which copies the bands are in, with the line's and the
 sender's numbers).
+
+## Read-backs and the card's copies (2026-11-26, later)
+
+What a submission handed on may write left out its read-backs into title memory
+(`deferred.backs`, which the line counts in the air); `pend` adds them now, and the
+destinations of the copies done on the card for it. A submission handed on with steps on
+the card no longer turns every next one down: only where the next refreshes or reads
+those copies (`card_steps::copied_read`, as for the line), or meets what it writes
+(`VICTORY_PIPE_OWN_ANY=1` brings back the old wait). Runs:
+
+- pipe5 (258 s, shots): 4.8 of 17.6 submissions a frame wait for the sender (10 before),
+  none for steps on the card; 54.4 ms; the picture at 250 s as with it off.
+- pipe6 against it off (one pair, 200 s, from 120 s): 56.6 ms against 57.8, within the
+  runs' spread. The submitting thread's time is 43.5 ms of the 57.8 with it off: the
+  rest of the frame is bound elsewhere, so taking B off that thread cannot shorten the
+  frame by much until that is found (the timeline of a run with it on).

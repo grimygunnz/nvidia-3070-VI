@@ -2647,7 +2647,8 @@ thread_local! {
 struct Pending {
     number: u64,
     written: Vec<(usize, usize)>,
-    own: bool,
+    /// The destinations of copies done on the card for it.
+    copies: Vec<card_steps::Writer>,
 }
 
 static PENDING: Mutex<Vec<Pending>> = Mutex::new(Vec::new());
@@ -2724,17 +2725,21 @@ pub(crate) fn drain_sender() {
 }
 
 /// `runs` handed to the sender as `number`: what they may write.
-fn pend(number: u64, runs: &[&HostList], own: bool) {
+fn pend(number: u64, runs: &[&HostList], own: Option<&card_steps::Taken>) {
     let mut written: Vec<(usize, usize)> = declared_writes(runs).into_iter().flat_map(|(_, r)| r).collect();
     written.extend(crate::picked::peek(runs));
     for list in runs {
         let deferred = list.deferred();
         written.extend(deferred.texture_backs.iter().map(crate::texback::Back::range));
         written.extend(deferred.writes.iter().map(|&(at, _, bytes)| (at, at + bytes.max(1))));
+        // (Read-backs into title memory: the line counts them in the air.)
+        written.extend(deferred.backs.iter().map(|&(_, at, [row, rows, pitch])| (at, at + rows.saturating_sub(1) * pitch + row)));
     }
+    let copies: Vec<card_steps::Writer> = own.map(|t| t.copied().collect()).unwrap_or_default();
+    written.extend(copies.iter().map(card_steps::Writer::range));
     let mut joined = Vec::new();
     join_ranges(&mut joined, written);
-    PENDING.lock().unwrap_or_else(|e| e.into_inner()).push(Pending { number, written: joined, own });
+    PENDING.lock().unwrap_or_else(|e| e.into_inner()).push(Pending { number, written: joined, copies });
 }
 
 /// The line has noted submission `number`.
@@ -2751,13 +2756,21 @@ fn pending_blocks(runs: &[&HostList]) -> bool {
     if pending.is_empty() {
         return false;
     }
-    if pending.iter().any(|p| p.own) {
+    if !own_any() && pending.iter().any(|p| !p.copies.is_empty()) {
         return true;
     }
     let mut all = Vec::new();
     join_ranges(&mut all, pending.iter().flat_map(|p| p.written.iter().copied()));
+    let copies: Vec<card_steps::Writer> = pending.iter().flat_map(|p| p.copies.iter().cloned()).collect();
     drop(pending);
-    blocked_by(&all, runs, false).is_some()
+    blocked_by(&all, runs, false).is_some() || card_steps::copied_read(&copies, runs)
+}
+
+/// Whether a submission handed on with steps done on the card blocks the
+/// next only where it meets them (`VICTORY_PIPE_OWN_ANY=1`; else always).
+fn own_any() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_PIPE_OWN_ANY").is_ok_and(|v| v.trim() == "1"))
 }
 
 /// A submission prepared on the CPU's side (stage A, `docs/pipeline.md`):
@@ -5363,7 +5376,7 @@ impl Host {
             PIPE_STATS[0].fetch_add(1, Ordering::Relaxed);
             if pending_blocks(&runs) {
                 PIPE_STATS[1].fetch_add(1, Ordering::Relaxed);
-                if PENDING.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|p| p.own) {
+                if PENDING.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|p| !p.copies.is_empty()) {
                     PIPE_STATS[2].fetch_add(1, Ordering::Relaxed);
                 }
                 drain_sender();
@@ -5372,7 +5385,7 @@ impl Host {
             let prepared = self.prepare(&runs, parts, true, true);
             DRAIN_FIRST.set(false);
             let number = prepared.this_submission;
-            pend(number, &runs, prepared.own.is_some());
+            pend(number, &runs, prepared.own.as_ref());
             drop(runs);
             // SAFETY: the host lives as long as the process; the prepared
             // submission holds no guard of the submission lock (`pipelined`).

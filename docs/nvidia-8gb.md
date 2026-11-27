@@ -369,3 +369,12 @@ Their main speed-up, compares of card copies on the card, this tree already has
   The biggest single copy left is the page pool's 174 MB view (10.5 refreshes a frame,
   5.4 ms, 14 MB written by the title a frame in 590 pieces); in place it needs the
   pool's sections committed (`SEC_COMMIT`), which `xmem` makes reserved.
+- **Blocks left open until the frame ends, tried and taken out.** A block a write fault
+  opened stayed open for the rest of the frame (copied as written at each refresh, not
+  made read-only again): 82.0 ms against 56.8 (run rf), the protections changed hardly
+  fewer (287 blocks a frame against 306) and the copies of open blocks at every
+  refresh much more. With the page pool's view refreshed ten times a frame, a written
+  block is cheaper guarded again than copied again. The page pool in place (the card
+  reading it) is not tried: the pool is one 6.1 GB reserved section (the host opens
+  only whole committed ones), the view is a buffer (in place for buffers is not safe
+  with flights sent ahead), and the card reading private windows in place was slower.

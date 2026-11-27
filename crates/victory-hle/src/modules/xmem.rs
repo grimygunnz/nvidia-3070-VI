@@ -762,7 +762,8 @@ pub extern "system" fn XMemAllocatePhysicalPages(
 /// committed sections, which the card's side can open as heaps.
 fn sections_in_place() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_INPLACE_SECTIONS").is_ok_and(|v| v.trim() == "1"))
+    let on = |name: &str| std::env::var(name).is_ok_and(|v| v.trim() == "1");
+    *ON.get_or_init(|| on("VICTORY_INPLACE_SECTIONS") || on("VICTORY_PAGE_TABLE"))
 }
 
 /// Page numbers count 4 KiB frames, so a 64 KiB page's is a multiple of

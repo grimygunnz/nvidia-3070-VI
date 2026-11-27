@@ -1437,7 +1437,22 @@ impl State {
                 addresses.push(self.view_address(compute, u.slot, u.dword));
             }
         }
-        crate::memory::ready(list, heap, &addresses, &written, &constants, use_, t.threads)
+        // With the page table (`VICTORY_PAGE_TABLE`): root views read
+        // through it. In the title's sections the directory has their pages
+        // already; elsewhere their buffer's copy, brought up to date as a
+        // root view's is.
+        let mut roots = Vec::new();
+        if victory_shader::emit::page_table() {
+            for u in t.used.iter().filter(|u| u.kind == ResourceType::Srv && u.root == RootType::Descriptor) {
+                if let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(u.slot))
+                    && crate::inplace::section_page(address as usize).is_none()
+                {
+                    let _ = root_view(list, address, true);
+                    roots.push(address);
+                }
+            }
+        }
+        crate::memory::ready(list, heap, &addresses, &written, &constants, use_, t.threads, &roots)
     }
 
     /// The bound heap holding `handle`.

@@ -2974,6 +2974,13 @@ impl Shadow {
     /// over it in a heap opened on it. Shaped as a copy so that everything
     /// that binds, views or keeps a copy works on it unchanged; what
     /// copies does nothing ([`Shadow::update`], [`Shadow::gpu_writes`]).
+    /// A piece of one of the title's sections for the page table
+    /// (`crate::memory`): `offset` in the section, no title address.
+    pub(crate) fn placed_piece(placed: crate::inplace::Placed, offset: u64, len: u64) -> Shadow {
+        let _ = offset;
+        Shadow::placed(placed, 0, len, false)
+    }
+
     fn placed(placed: crate::inplace::Placed, start: u64, len: u64, window: bool) -> Shadow {
         crate::host::name(&placed.buffer, || format!("title memory {start:#x}+{len:#x} in place"));
         let mut shadow = Shadow::new(placed.buffer, start as *mut u8, placed.gpu, start, len);

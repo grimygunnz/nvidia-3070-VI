@@ -212,8 +212,29 @@ pub(crate) fn sections() -> bool {
 /// The heaps opened on the title's sections, by handle (`None`: refused).
 static SECTION_HEAPS: std::sync::Mutex<Vec<(usize, Option<ID3D12Heap>)>> = std::sync::Mutex::new(Vec::new());
 
+/// The committed section and byte offset in it of the 64 KiB page of title
+/// memory at `at`, if a view of one shows that page.
+pub(crate) fn section_page(at: usize) -> Option<(usize, u64)> {
+    let v = views();
+    let Cover::Run(section, offset) = cover_in(&v.views, at & !(K64 - 1), K64) else {
+        return None;
+    };
+    v.sections.iter().any(|s| s.0 == section && s.2).then_some((section, offset))
+}
+
+/// The title's views of committed sections now: address, bytes, section,
+/// offset.
+pub(crate) fn section_views() -> Vec<(usize, usize, usize, u64)> {
+    let v = views();
+    v.views
+        .iter()
+        .filter(|(_, w)| v.sections.iter().any(|s| s.0 == w.1 && s.2))
+        .map(|(&at, &(bytes, section, offset))| (at, bytes, section, offset))
+        .collect()
+}
+
 /// `len` bytes from `offset` of `section` as a buffer in it.
-fn place_in_section(section: usize, offset: u64, len: u64) -> Option<Placed> {
+pub(crate) fn place_in_section(section: usize, offset: u64, len: u64) -> Option<Placed> {
     let bytes_of = {
         let v = views();
         v.sections.iter().find(|s| s.0 == section).filter(|s| s.2).map(|s| s.1)
@@ -428,12 +449,19 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
     // another view must look at them again, and the pages are noted written
     // there (`crate::watch`).
     crate::watch::views_mapped(section, offset, len);
+    // The page table finds these pages in the section from now on.
+    if victory_shader::emit::page_table() && views().sections.iter().any(|s| s.0 == section && s.2) {
+        crate::memory::section_view(at, len, section, offset);
+    }
 }
 
 /// What `[at, at + len)` showed is gone ([`crate::title_memory_remapped`]):
 /// the views that touch it are forgotten (the runtime tells again those it
 /// maps anew).
 pub(crate) fn views_gone(at: usize, len: usize) {
+    if victory_shader::emit::page_table() {
+        crate::memory::section_gone(at, len);
+    }
     let mut v = views_mut();
     if v.views.is_empty() {
         return;

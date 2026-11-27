@@ -192,6 +192,16 @@ pub fn builder_fences() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_FENCES").is_none_or(|v| v != "0"))
 }
 
+/// `VICTORY_PAGE_TABLE=1`: every program's root views that are read only
+/// read title memory through the page directory (`shader.rs`
+/// `SLOT_MEMORY`), as the structure builder's programs do, not through a
+/// view of one copy: the host points each 64 KiB page at a copy of it or at
+/// the title's own pages (`docs/pipeline.md`).
+pub fn page_table() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PAGE_TABLE").is_some_and(|v| v == "1"))
+}
+
 /// Whether the structure builder's accesses through its root views stay near
 /// them, and a size in a structure's header that cannot be one counts as none
 /// (`VICTORY_BVH_BOUNDS=0`: neither). Part of the translation: the shader

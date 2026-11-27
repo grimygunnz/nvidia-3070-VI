@@ -80,6 +80,9 @@ use crate::shadow::Shadow;
 const COPIES: u32 = (1 << 12) - 1;
 /// A directory page.
 const PAGE: u64 = 1 << 16;
+/// The pieces the title's committed page sections are numbered in, each a
+/// buffer placed in the section and a raw view of it (`VICTORY_PAGE_TABLE`).
+const CHUNK: u64 = 256 << 20;
 /// An arena's bytes.
 const ARENA: u64 = 64 << 20;
 /// What is compared at a time.
@@ -153,6 +156,9 @@ struct Memory {
     numbers: HashMap<usize, usize>,
     /// Arenas: place in `copies`, address.
     arenas: Vec<(usize, usize)>,
+    /// Pieces of the title's sections by section and piece: place in
+    /// `copies` (`VICTORY_PAGE_TABLE`).
+    chunks: HashMap<(usize, u64), usize>,
     /// By title page.
     pages: HashMap<u64, Held>,
     /// Their numbers in the order they came, and where the sweep is.
@@ -240,6 +246,7 @@ impl Memory {
             copies: Vec::new(),
             numbers: HashMap::new(),
             arenas: Vec::new(),
+            chunks: HashMap::new(),
             pages: HashMap::new(),
             order: Vec::new(),
             sweep: 0,
@@ -386,6 +393,78 @@ impl Memory {
         };
         self.hold(page, at, copy);
         true
+    }
+
+    /// The place in `copies` of piece `chunk` of `section`, numbered when
+    /// first asked for.
+    fn chunk(&mut self, section: usize, chunk: u64) -> Option<usize> {
+        if let Some(&n) = self.chunks.get(&(section, chunk)) {
+            return Some(n);
+        }
+        let placed = crate::inplace::place_in_section(section, chunk * CHUNK, CHUNK)?;
+        // (The last piece of a section, and a small section, are shorter.)
+        // SAFETY: a live buffer.
+        let len = unsafe { placed.buffer.GetDesc() }.Width;
+        let shadow = Arc::new(Shadow::placed_piece(placed, chunk * CHUNK, len));
+        let n = self.number(shadow)?;
+        self.chunks.insert((section, chunk), n);
+        Some(n)
+    }
+
+    /// The title shows `len` bytes of `section` from `offset` on at `at`:
+    /// the directory finds those pages in the section's pieces.
+    fn section_fill(&mut self, at: usize, len: usize, section: usize, offset: u64) {
+        for k in 0..len as u64 / PAGE {
+            let page = at as u64 / PAGE + k;
+            if page == 0 || page >= u64::from(MEMORY_PAGES) - 1 {
+                continue;
+            }
+            let off = offset + k * PAGE;
+            let Some(n) = self.chunk(section, off / CHUNK) else { continue };
+            close(self.entry(page), n, off % CHUNK);
+        }
+    }
+
+    /// What the title showed at `[at, at + len)` is gone: the entries of the
+    /// sections' pieces there are emptied.
+    fn section_empty(&mut self, at: usize, len: usize) {
+        if self.chunks.is_empty() {
+            return;
+        }
+        let pieces: std::collections::HashSet<usize> = self.chunks.values().copied().collect();
+        for page in at as u64 / PAGE..(at + len) as u64 / PAGE {
+            if page == 0 || page >= u64::from(MEMORY_PAGES) - 1 {
+                continue;
+            }
+            if self.copy_of(page).is_some_and(|n| pieces.contains(&n)) {
+                // SAFETY: an entry of the directory, under the mutex.
+                unsafe { self.entry(page).write_volatile(0) };
+            }
+        }
+    }
+
+    /// A root view read through the page table that is not in a section:
+    /// its title buffer's copy, numbered and its pages entered.
+    fn map_buffer(&mut self, at: u64) -> bool {
+        if self.copy_of(at / PAGE).is_some() {
+            return true;
+        }
+        let Some(shadow) = crate::shadow::find(at, 1) else { return false };
+        let Some(n) = self.number(shadow.clone()) else { return false };
+        let (first, len) = shadow.span();
+        let last = (first + len.max(1) - 1) / PAGE;
+        for page in first / PAGE..=last {
+            if page == 0 || page >= u64::from(MEMORY_PAGES) - 1 || self.copy_of(page).is_some() {
+                continue;
+            }
+            // (A page the copy holds only from its middle on reads before
+            // the copy's start as the copy's start: not entered.)
+            if page * PAGE < first {
+                continue;
+            }
+            close(self.entry(page), n, page * PAGE - first);
+        }
+        self.copy_of(at / PAGE).is_some()
     }
 
     /// Another arena's pages.
@@ -847,6 +926,22 @@ fn close(entry: *mut u32, n: usize, offset: u64) {
     fill(entry, n | MEMORY_READ_ONLY as usize, offset);
 }
 
+/// The title maps `len` bytes of committed `section` from `offset` at `at`
+/// (`VICTORY_PAGE_TABLE`).
+pub(crate) fn section_view(at: usize, len: usize, section: usize, offset: u64) {
+    if let Some(m) = MEMORY.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        m.section_empty(at, len);
+        m.section_fill(at, len, section, offset);
+    }
+}
+
+/// What the title showed at `[at, at + len)` is gone.
+pub(crate) fn section_gone(at: usize, len: usize) {
+    if let Some(m) = MEMORY.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        m.section_empty(at, len);
+    }
+}
+
 /// The offset first: a shader that sees the number sees it too.
 fn fill(entry: *mut u32, n: usize, offset: u64) {
     // SAFETY: an entry of the directory, under the mutex.
@@ -902,12 +997,23 @@ pub(crate) fn ready(
     constants: &[u32],
     use_: Use,
     threads: Option<[u32; 3]>,
+    roots: &[u64],
 ) -> Option<Ready> {
     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
         *guard = Memory::new();
+        if victory_shader::emit::page_table()
+            && let Some(m) = guard.as_mut()
+        {
+            for (at, len, section, offset) in crate::inplace::section_views() {
+                m.section_fill(at, len, section, offset);
+            }
+        }
     }
     let m = guard.as_mut()?;
+    for &at in roots {
+        m.map_buffer(at);
+    }
     let frame = crate::frame::current();
     if m.frame != frame {
         m.frame = frame;

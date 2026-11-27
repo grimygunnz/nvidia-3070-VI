@@ -3200,11 +3200,19 @@ impl<'a> Lower<'a> {
             return None;
         };
         let rp = *self.x.native.layout.get(address.param)?;
-        if rp.root != RootType::Descriptor || !crate::spill::is_spilled(self.x.native) {
+        if rp.root != RootType::Descriptor {
             return None;
         }
         let used = self.x.native.used.iter().find(|u| u.user_data == rp.user_data)?;
-        if !matches!(used.kind, ResourceType::Srv | ResourceType::Uav) {
+        // The builder's programs, every root view; with the page table
+        // (`super::page_table`) every program's root views that are read
+        // only: the directory finds each 64 KiB page of title memory where it
+        // is, in a copy or in the title's own pages. (Root views written keep
+        // their copies: what is written there comes back from them.)
+        let spilled = crate::spill::is_spilled(self.x.native);
+        if !(spilled && matches!(used.kind, ResourceType::Srv | ResourceType::Uav)
+            || !spilled && super::page_table() && used.kind == ResourceType::Srv)
+        {
             return None;
         }
         let lo = self.host_word(RootType::Other(USER_ROOT_ADDRESS), rp.slot, 0);
@@ -3231,7 +3239,7 @@ impl<'a> Lower<'a> {
         let hi = self.s.m.bin(c, Bin::Add, hi, carry);
         let mut hi = self.s.m.bin(c, Bin::Add, hi, sign);
         let mut sum = sum;
-        if super::builder_bounds() {
+        if super::builder_bounds() && crate::spill::is_spilled(self.x.native) {
             // No structure is near 64 MiB (the greatest seen has 14). One
             // whose memory was written over says it has gigabytes, and the
             // builder's copy of it went through all other structures' memory

@@ -161,3 +161,27 @@ taken further: choose by what each buffer costs (bytes the title writes a frame 
 bytes the card reads), and for scattered pages the console's page table in the
 translated shaders (an address through a table of 64 KiB pages into one buffer over the
 whole section), which needs no tiled mapping.
+
+## The console's page table in the shaders (`VICTORY_PAGE_TABLE=1`, off): first slice
+
+The shaders already had a page directory for the structure builder (`memory.rs`,
+`SLOT_MEMORY`): per 64 KiB page of title addresses, a numbered buffer and the page's
+offset in it. With the switch: the title's physical-page sections are committed and
+cut into 256 MB pieces placed in the section (`inplace::place_in_section`), each a
+numbered buffer; when the title maps a view of a section its pages' entries point at
+the pieces (out of order is no matter: each page has its own entry), and are emptied
+when it unmaps it. Every program's root views that are only read go through the
+directory (`resource`'s `root_address`, no longer the builder's alone); one outside the
+sections keeps its buffer's copy, refreshed as before.
+
+Run pt2: no crash (pt1 removed the device: a piece's view was given 256 MB where the
+section's last piece is shorter), the picture as without it, 3,131 dispatches a frame
+read through the directory with no page missing; 55.2 ms, the same. The 174 MB pool is
+still copied 11 times a frame: it is a root UAV (written), and table views read it too.
+
+What is left for the pool: writes through the directory (root UAVs: no refresh, no
+copy back), and the buffer views of the view heap that lie in a section placed on the
+section's piece (a view within one 64 KiB page is always one run), so that nothing reads
+the pool's copy and the card's writes are what every reader sees. Then the card reads
+the pool over the bus: the cost run sec4 showed for 145 MB (36 ms of the card's time a
+frame) is what to measure.

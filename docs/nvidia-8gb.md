@@ -360,3 +360,12 @@ Their main speed-up, compares of card copies on the card, this tree already has
   `XMemVirtualAlloc` (write-watched, below 2^40). Run xw against xwbase, the full light
   on: 57.7 ms against 66.6 (17.3 fps against 15.0); that buffer now goes up 0 MB a
   frame and its refresh is 1.5 ms instead of 2.8; the picture is the same.
+- **After the watched blocks (run tl2, a timeline at 240 s).** The submitting thread
+  runs 54 ms a frame (the line, joined submissions 34.7); the title's main thread
+  (51824) 37.5 ms with 18.3 ms waiting, 0.1 ms of it in our fault handler; the card 25
+  ms busy and 13 ms idle a frame, 7 ms of that behind a thread putting title bytes under
+  flights' writes. Tried and not kept: `VICTORY_INPLACE=1` (83 windows, 400 MB read by
+  the card over PCIe: 62.7 ms against 57.7; 1,230 windows refused as view memory).
+  The biggest single copy left is the page pool's 174 MB view (10.5 refreshes a frame,
+  5.4 ms, 14 MB written by the title a frame in 590 pieces); in place it needs the
+  pool's sections committed (`SEC_COMMIT`), which `xmem` makes reserved.

@@ -385,3 +385,9 @@ Their main speed-up, compares of card copies on the card, this tree already has
   joins, if already touched), and a submission takes the queue. Run tq: 54.6 ms a
   frame against 56.8 (18.3 fps), the copies in the card's memory 6.7 ms against 9.8,
   the picture the same.
+- **The write watch's gap between ranges asked together (`VICTORY_AHEAD_GAP_KB`, 8192).**
+  512 KiB (run gap): 337 kernel askings over 1.2 GB a frame against 216 over 1.6 GB,
+  4.9 ms against 5.5, the frame 54.6 ms against 55.1: no change worth a default. Of the
+  submitting thread's lists' steps (about 6.5 ms a frame of its own), the 13,000 small
+  copies into title memory are 0.27 us each; the rest is the bookkeeping of 20,000
+  refresh steps.

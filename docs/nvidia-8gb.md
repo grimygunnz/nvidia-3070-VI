@@ -378,3 +378,10 @@ Their main speed-up, compares of card copies on the card, this tree already has
   reading it) is not tried: the pool is one 6.1 GB reserved section (the host opens
   only whole committed ones), the view is a buffer (in place for buffers is not safe
   with flights sent ahead), and the card reading private windows in place was slower.
+- **The copies in the card's memory to send: from a queue of those touched.** Each
+  submission went through every copy in the card's memory (`shadow::card_dirty`) for
+  the few whose CPU side had changed: 3.1 ms a frame of the submitting thread's. A copy
+  now names itself in a queue when its `touched` goes from false to true (and when it
+  joins, if already touched), and a submission takes the queue. Run tq: 54.6 ms a
+  frame against 56.8 (18.3 fps), the copies in the card's memory 6.7 ms against 9.8,
+  the picture the same.

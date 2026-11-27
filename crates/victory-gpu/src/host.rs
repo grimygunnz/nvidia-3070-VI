@@ -2626,6 +2626,30 @@ type Declared = (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>);
 
 /// What [`Host::submit`] hands back for a submission it sent and did not
 /// wait for.
+/// A submission prepared on the CPU's side (stage A, `docs/pipeline.md`):
+/// what its card's side ([`Host::finish`]) takes over.
+struct Prepared<'a> {
+    submitted: std::sync::MutexGuard<'a, u64>,
+    parts: Vec<usize>,
+    late: bool,
+    own: Option<card_steps::Taken>,
+    lists: Vec<Option<ID3D12CommandList>>,
+    firsts: Vec<usize>,
+    batch: Batch,
+    heaps_synced: crate::descriptor::SyncedHeaps,
+    settled: std::time::Duration,
+    started: std::time::Instant,
+    was_working: bool,
+    this_submission: u64,
+    stage: crate::timeline::Span,
+    #[cfg(feature = "diagnostics")]
+    called: std::time::Instant,
+    #[cfg(feature = "diagnostics")]
+    lock: u64,
+    #[cfg(feature = "diagnostics")]
+    split: Split,
+}
+
 struct Sent {
     /// Its number among the submissions started.
     number: u64,
@@ -5481,6 +5505,7 @@ impl Host {
     /// ([`joins`]): those go to the queue in calls of their own, one after the
     /// other, as they would have.
     fn submit<'a>(&'a self, runs: &[&HostList], parts: &[usize], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
+        let given = runs;
         #[cfg(feature = "diagnostics")]
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -5664,6 +5689,67 @@ impl Host {
         }
         #[cfg(feature = "diagnostics")]
         split.part(3);
+        let prepared = Prepared {
+            submitted,
+            parts,
+            late,
+            own,
+            lists,
+            firsts,
+            batch,
+            heaps_synced,
+            settled,
+            started,
+            was_working,
+            this_submission,
+            stage,
+            #[cfg(feature = "diagnostics")]
+            called,
+            #[cfg(feature = "diagnostics")]
+            lock,
+            #[cfg(feature = "diagnostics")]
+            split,
+        };
+        self.finish(given, prepared)
+    }
+
+    /// The card's side of a submission [`Host::submit`] prepared (stage B,
+    /// `docs/pipeline.md`): copies in the card's memory, the views picked by
+    /// index, the heaps' records, sending.
+    fn finish<'a>(&'a self, given: &[&HostList], prepared: Prepared<'a>) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
+        let Prepared {
+            mut submitted,
+            parts,
+            late,
+            own,
+            mut lists,
+            mut firsts,
+            mut batch,
+            heaps_synced,
+            mut settled,
+            started,
+            was_working,
+            this_submission,
+            mut stage,
+            #[cfg(feature = "diagnostics")]
+            called,
+            #[cfg(feature = "diagnostics")]
+            lock,
+            #[cfg(feature = "diagnostics")]
+            split,
+        } = prepared;
+        #[cfg(feature = "diagnostics")]
+        let _ = called;
+        // The submission's lists, the list of the steps taken for the card
+        // first (as `submit` has them).
+        let with: Vec<&HostList>;
+        let runs = match &own {
+            Some(own) => {
+                with = std::iter::once(own.list()).chain(given.iter().copied()).collect();
+                &with[..]
+            }
+            None => given,
+        };
         stage.next("submit: copies in the card's memory");
         // Copies in the card's memory: what changed on their CPU side goes
         // up ahead of the lists, and a compare of what the shaders may

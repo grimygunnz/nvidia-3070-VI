@@ -33,6 +33,8 @@ rem The game's own light: its ray resolve runs with no structure (every ray miss
 if not defined VICTORY_AMBIENT set "VICTORY_AMBIENT=0"
 if not defined VICTORY_RT_RESOLVE set "VICTORY_RT_RESOLVE=1"
 if not defined VICTORY_ACTIVATE_RAYS set "VICTORY_ACTIVATE_RAYS=1"
+rem Every node test a miss: no walks over the never-built structures (they lit hair and walls white)
+if not defined VICTORY_BVH_MISS set "VICTORY_BVH_MISS=1"
 if not defined VICTORY_THIN set "VICTORY_THIN=1"
 if not defined VICTORY_JOIN_PARTS set "VICTORY_JOIN_PARTS=8"
 if not defined VICTORY_UPLOAD_AHEAD set "VICTORY_UPLOAD_AHEAD=1"

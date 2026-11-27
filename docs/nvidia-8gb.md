@@ -332,3 +332,23 @@ later, frame times settle by 130 s), one pair per change.
   prison is lit as it should be, no bands, at 68-75 ms a frame against 60-63. The
   launchers (`Play-VIctory.cmd`, `scripts/play-guarded.ps1`) now set: AMBIENT=0,
   RT_RESOLVE=1, ACTIVATE_RAYS=1, LEVELS_ON_DEMAND=0, TEXTURE_MAX_SIDE=1024.
+
+## From the NVIDIA megafork (rorodev6/victory-nvidia-megafork, audited 2026-11-26)
+
+Shares 0a435665 with this tree; 39 commits since, from trustno1-coder's NVIDIA tuning
+and pull requests. Brought here:
+- `VICTORY_BVH_MISS=1` (24a479d; added to the shader cache's key here): every box and
+  triangle test is a miss, so a ray never walks the structures the builder never made.
+  With the resolve run (above), the walks over stale nodes lit some things white (hair
+  blown out to flat orange, run nomiss2); with it the picture is right (run miss2), at
+  the same frame time (69.7 against 69.9 ms). In the launchers now.
+- The mouse as a GameInput device, so the camera follows it (12b1d16).
+- Texture read-backs tiled and written by a thread of their own (2d1dc38), off the
+  landing thread, which waited on the mapping lock while the world streamed.
+- Pipeline jobs finished after a panic in a worker (b5fc030).
+Not brought: the face network's 16-bit values through integer views (faces did not
+move on NVIDIA; mixed into 77e13a9 with their ray-tracing skip list and other
+changes), half render scale and the title's own upscaler (GPU-side; this PC is CPU
+bound), Smooth Motion (RTX 40/50 only), `VICTORY_THIN=0` (a whiteout on 50-series).
+Their main speed-up, compares of card copies on the card, this tree already has
+(`VICTORY_CARD_BUFFERS_MIN_KB=64`).

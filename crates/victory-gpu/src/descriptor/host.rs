@@ -1262,6 +1262,10 @@ fn view_home(
     len: u64,
     (stride, raw, format): (u32, bool, u32),
 ) -> std::sync::Arc<crate::shadow::Shadow> {
+    // In place: the title's own bytes, no other copy of them.
+    if shadow.in_place() {
+        return shadow;
+    }
     let Some(offset) = shadow.offset_in(start).map(|_| shadow.offset(start)) else {
         return shadow;
     };
@@ -3618,6 +3622,10 @@ pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::
     let (address, len) = buffer_range(view)?;
     if len == 0 {
         return None;
+    }
+    // As the slot was made: on its own range in place (the page table's).
+    if let Some(shadow) = crate::shadow::find(address, len).filter(|s| s.in_place()) {
+        return Some((shadow, address, len));
     }
     if view_extent()
         && let Some((base, width)) = buffer_extent(view)

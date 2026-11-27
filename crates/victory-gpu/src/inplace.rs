@@ -222,6 +222,23 @@ pub(crate) fn section_page(at: usize) -> Option<(usize, u64)> {
     v.sections.iter().any(|s| s.0 == section && s.2).then_some((section, offset))
 }
 
+/// The committed section and the offset in it of `[at, at + len)`, if it
+/// is all one run of one.
+pub(crate) fn section_run(at: usize, len: usize) -> Option<(usize, u64)> {
+    let v = views();
+    let Cover::Run(section, offset) = cover_in(&v.views, at, len) else {
+        return None;
+    };
+    v.sections.iter().any(|s| s.0 == section && s.2).then_some((section, offset))
+}
+
+/// A buffer of the title's in place counted (it is let go with
+/// [`gone`]).
+pub(crate) fn counted(len: u64) {
+    STATS[2].fetch_add(1, Ordering::Relaxed);
+    STATS[3].fetch_add(len, Ordering::Relaxed);
+}
+
 /// The title's views of committed sections now: address, bytes, section,
 /// offset.
 pub(crate) fn section_views() -> Vec<(usize, usize, usize, u64)> {
@@ -461,6 +478,7 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
 pub(crate) fn views_gone(at: usize, len: usize) {
     if victory_shader::emit::page_table() {
         crate::memory::section_gone(at, len);
+        crate::shadow::stand_ins_gone(at as u64, len as u64);
     }
     let mut v = views_mut();
     if v.views.is_empty() {

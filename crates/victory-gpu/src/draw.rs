@@ -1442,14 +1442,25 @@ impl State {
         // already; elsewhere their buffer's copy, brought up to date as a
         // root view's is.
         let mut roots = Vec::new();
-        if victory_shader::emit::page_table() {
-            for u in t.used.iter().filter(|u| u.kind == ResourceType::Srv && u.root == RootType::Descriptor) {
-                if let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(u.slot))
-                    && crate::inplace::section_page(address as usize).is_none()
-                {
-                    let _ = root_view(list, address, true);
-                    roots.push(address);
+        if victory_shader::emit::page_table() && !crate::pipeline::is_builder(self.pipeline as This) {
+            for u in t.used.iter().filter(|u| matches!(u.kind, ResourceType::Srv | ResourceType::Uav) && u.root == RootType::Descriptor) {
+                let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(u.slot)) else { continue };
+                if crate::inplace::section_page(address as usize).is_some() {
+                    continue;
                 }
+                let writes = u.kind == ResourceType::Uav;
+                if writes {
+                    // As `root_uav`: the copy brought up to date, and what
+                    // shaders store there copied back when the list has run.
+                    if let Some(s) = crate::shadow::find(address, 1) {
+                        let len = s.left(address);
+                        s.refresh(list, address, len);
+                        s.gpu_writes(list, address, len);
+                    }
+                } else {
+                    let _ = root_view(list, address, true);
+                }
+                roots.push((address, writes));
             }
         }
         crate::memory::ready(list, heap, &addresses, &written, &constants, use_, t.threads, &roots)
@@ -1676,7 +1687,11 @@ impl State {
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
                 // Only through a store by address: what it stores through
                 // views is declared with them.
-                let use_ = if crate::pipeline::is_builder(self.pipeline as This) || writes && t.stores_by_address {
+                // (With the page table every program stores by address
+                // through its root views: not the builder's ways for that.)
+                let use_ = if crate::pipeline::is_builder(self.pipeline as This)
+                    || writes && t.stores_by_address && !victory_shader::emit::page_table()
+                {
                     crate::memory::Use::Builds { back: writes }
                 } else {
                     crate::memory::Use::Reads

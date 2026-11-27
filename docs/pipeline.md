@@ -185,3 +185,15 @@ section's piece (a view within one 64 KiB page is always one run), so that nothi
 the pool's copy and the card's writes are what every reader sees. Then the card reads
 the pool over the bus: the cost run sec4 showed for 145 MB (36 ms of the card's time a
 frame) is what to measure.
+
+## Page table, writes (run pt3)
+
+Root UAVs go through the directory too (section pages writable; outside the sections a
+root UAV keeps its copy, refresh and copy back), and `shadow::find` gives a range with a
+length that is one run of a committed section, inside one piece, as a stand-in on the
+piece (no copy, no refresh): the view heap's buffer views and root constant buffers of
+the pool read and write the title's own pages. No crash; the picture at 250 s is
+smoother than ever: the walls' flat bands are gone (they were stale copies). The
+submitting thread 30.8 ms a frame (from 43-48), the card 54 ms reading over the bus,
+the frame 96.7 ms. Next: put pages that are read much and written little back in card
+copies (the directory chooses per page), and measure which buffers the card's time goes to.

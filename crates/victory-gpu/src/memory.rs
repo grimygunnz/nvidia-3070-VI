@@ -421,7 +421,8 @@ impl Memory {
             }
             let off = offset + k * PAGE;
             let Some(n) = self.chunk(section, off / CHUNK) else { continue };
-            close(self.entry(page), n, off % CHUNK);
+            // Writable: shaders write the title's own pages.
+            fill(self.entry(page), n, off % CHUNK);
         }
     }
 
@@ -445,8 +446,8 @@ impl Memory {
 
     /// A root view read through the page table that is not in a section:
     /// its title buffer's copy, numbered and its pages entered.
-    fn map_buffer(&mut self, at: u64) -> bool {
-        if self.copy_of(at / PAGE).is_some() {
+    fn map_buffer(&mut self, at: u64, writes: bool) -> bool {
+        if !writes && self.copy_of(at / PAGE).is_some() {
             return true;
         }
         let Some(shadow) = crate::shadow::find(at, 1) else { return false };
@@ -454,7 +455,10 @@ impl Memory {
         let (first, len) = shadow.span();
         let last = (first + len.max(1) - 1) / PAGE;
         for page in first / PAGE..=last {
-            if page == 0 || page >= u64::from(MEMORY_PAGES) - 1 || self.copy_of(page).is_some() {
+            if page == 0 || page >= u64::from(MEMORY_PAGES) - 1 || (!writes && self.copy_of(page).is_some()) {
+                continue;
+            }
+            if writes && self.copy_of(page).is_some_and(|c| c != n) {
                 continue;
             }
             // (A page the copy holds only from its middle on reads before
@@ -462,7 +466,11 @@ impl Memory {
             if page * PAGE < first {
                 continue;
             }
-            close(self.entry(page), n, page * PAGE - first);
+            if writes {
+                fill(self.entry(page), n, page * PAGE - first);
+            } else {
+                close(self.entry(page), n, page * PAGE - first);
+            }
         }
         self.copy_of(at / PAGE).is_some()
     }
@@ -935,6 +943,31 @@ pub(crate) fn section_view(at: usize, len: usize, section: usize, offset: u64) {
     }
 }
 
+/// Piece `piece` of committed `section` as the page table has it: its
+/// buffer, heap and the card's address of its first byte
+/// (`VICTORY_PAGE_TABLE`).
+pub(crate) fn piece(section: usize, piece: u64) -> Option<(ID3D12Resource, ID3D12Heap, u64)> {
+    let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        *guard = Memory::new();
+        if let Some(m) = guard.as_mut() {
+            for (at, len, section, offset) in crate::inplace::section_views() {
+                m.section_fill(at, len, section, offset);
+            }
+        }
+    }
+    let m = guard.as_mut()?;
+    let n = m.chunk(section, piece)?;
+    let shadow = &m.copies[n];
+    let heap = shadow.place_heap()?;
+    // SAFETY: a live buffer.
+    let gpu = unsafe { shadow.buffer.GetGPUVirtualAddress() };
+    Some((shadow.buffer.clone(), heap, gpu))
+}
+
+/// The bytes of a piece.
+pub(crate) const PIECE_BYTES: u64 = CHUNK;
+
 /// What the title showed at `[at, at + len)` is gone.
 pub(crate) fn section_gone(at: usize, len: usize) {
     if let Some(m) = MEMORY.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
@@ -997,7 +1030,7 @@ pub(crate) fn ready(
     constants: &[u32],
     use_: Use,
     threads: Option<[u32; 3]>,
-    roots: &[u64],
+    roots: &[(u64, bool)],
 ) -> Option<Ready> {
     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
@@ -1011,8 +1044,8 @@ pub(crate) fn ready(
         }
     }
     let m = guard.as_mut()?;
-    for &at in roots {
-        m.map_buffer(at);
+    for &(at, writes) in roots {
+        m.map_buffer(at, writes);
     }
     let frame = crate::frame::current();
     if m.frame != frame {

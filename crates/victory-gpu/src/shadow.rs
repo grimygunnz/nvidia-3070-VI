@@ -2974,11 +2974,34 @@ impl Shadow {
     /// over it in a heap opened on it. Shaped as a copy so that everything
     /// that binds, views or keeps a copy works on it unchanged; what
     /// copies does nothing ([`Shadow::update`], [`Shadow::gpu_writes`]).
+    /// The heap of a copy in place.
+    pub(crate) fn place_heap(&self) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Heap> {
+        self.place.as_ref().map(|p| p.0.clone())
+    }
+
     /// A piece of one of the title's sections for the page table
     /// (`crate::memory`): `offset` in the section, no title address.
     pub(crate) fn placed_piece(placed: crate::inplace::Placed, offset: u64, len: u64) -> Shadow {
         let _ = offset;
-        Shadow::placed(placed, 0, len, false)
+        crate::inplace::counted(len);
+        let mut shadow = Shadow::new(placed.buffer, std::ptr::null_mut(), placed.gpu, 0, len);
+        LIVE[0].fetch_sub(1, Ordering::Relaxed);
+        LIVE[1].fetch_sub(len, Ordering::Relaxed);
+        *shadow.watched.get_mut() = NOT_WATCHED;
+        shadow.place = Some((placed.heap, placed.bias));
+        shadow
+    }
+
+    /// Title memory `[start, start + len)` read and written in a piece of
+    /// its section ([`section_stand_in`]): shaped as a copy, as
+    /// [`Shadow::placed`], on the piece's buffer (not named again).
+    fn stand_in(placed: crate::inplace::Placed, start: u64, len: u64) -> Shadow {
+        let mut shadow = Shadow::new(placed.buffer, start as *mut u8, placed.gpu, start, len);
+        LIVE[0].fetch_sub(1, Ordering::Relaxed);
+        LIVE[1].fetch_sub(len, Ordering::Relaxed);
+        *shadow.watched.get_mut() = NOT_WATCHED;
+        shadow.place = Some((placed.heap, placed.bias));
+        shadow
     }
 
     fn placed(placed: crate::inplace::Placed, start: u64, len: u64, window: bool) -> Shadow {
@@ -5004,7 +5027,66 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
 /// len)`, made on first use. A `len` of 0 or 1 is an ask without a length
 /// (a root view: the caller reads on to the copy's end).
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    if let Some(stand_in) = section_stand_in(address, len) {
+        return Some(stand_in);
+    }
     lookup(address, len, false)
+}
+
+/// With the page table (`VICTORY_PAGE_TABLE`): a range of title memory with a
+/// length that lies in one run of one of the title's committed page sections,
+/// within one of the page table's pieces of it (`crate::memory::piece`), is
+/// no copy but that piece from the run's place on: views and binds of it
+/// read and write the title's own pages, as the page table's accesses do,
+/// and nothing refreshes or copies back. Cut on 64 KiB pages and kept until
+/// the title maps something else there ([`stand_ins_gone`]).
+/// shortcut: a slot made with one keeps showing those physical pages after
+/// the title maps others there, until the slot is made again.
+fn section_stand_in(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    const P: u64 = 1 << 16;
+    if len <= 1 || !victory_shader::emit::page_table() {
+        return None;
+    }
+    let start = address & !(P - 1);
+    let end = address.checked_add(len)?.next_multiple_of(P);
+    let key = (start, end - start);
+    if let Some(s) = STANDS.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return Some(s.clone());
+    }
+    let (section, off) = crate::inplace::section_run(start as usize, (end - start) as usize)?;
+    let bytes = crate::memory::PIECE_BYTES;
+    let piece = off / bytes;
+    if off + (end - start) > (piece + 1) * bytes {
+        return None;
+    }
+    let (buffer, heap, gpu) = crate::memory::piece(section, piece)?;
+    let bias = off - piece * bytes;
+    let placed = crate::inplace::Placed { buffer, heap, gpu: gpu + bias, bias };
+    crate::inplace::counted(end - start);
+    let shadow = Arc::new(Shadow::stand_in(placed, start, end - start));
+    STANDS.lock().unwrap_or_else(|e| e.into_inner()).insert(key, shadow.clone());
+    Some(shadow)
+}
+
+/// [`section_stand_in`]'s, by title range.
+static STANDS: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+
+/// The title maps something else at `[at, at + len)`: stand-ins there go.
+pub(crate) fn stand_ins_gone(at: u64, len: u64) {
+    let end = at.saturating_add(len);
+    let mut map = STANDS.lock().unwrap_or_else(|e| e.into_inner());
+    if map.is_empty() {
+        return;
+    }
+    // (None is longer than a piece.)
+    let keys: Vec<(u64, u64)> = map
+        .range((at.saturating_sub(crate::memory::PIECE_BYTES), 0)..(end, 0))
+        .filter(|(key, _)| key.0 + key.1 > at)
+        .map(|(key, _)| *key)
+        .collect();
+    for key in keys {
+        map.remove(&key);
+    }
 }
 
 /// As [`find`], for an ask that is done with the copy when its list has

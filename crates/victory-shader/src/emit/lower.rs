@@ -3204,15 +3204,12 @@ impl<'a> Lower<'a> {
             return None;
         }
         let used = self.x.native.used.iter().find(|u| u.user_data == rp.user_data)?;
-        // The builder's programs, every root view; with the page table
-        // (`super::page_table`) every program's root views that are read
-        // only: the directory finds each 64 KiB page of title memory where it
-        // is, in a copy or in the title's own pages. (Root views written keep
-        // their copies: what is written there comes back from them.)
+        // The builder's programs, and with the page table
+        // (`super::page_table`) every program: the directory finds each
+        // 64 KiB page of title memory where it is, in a copy or in the
+        // title's own pages.
         let spilled = crate::spill::is_spilled(self.x.native);
-        if !(spilled && matches!(used.kind, ResourceType::Srv | ResourceType::Uav)
-            || !spilled && super::page_table() && used.kind == ResourceType::Srv)
-        {
+        if !((spilled || super::page_table()) && matches!(used.kind, ResourceType::Srv | ResourceType::Uav)) {
             return None;
         }
         let lo = self.host_word(RootType::Other(USER_ROOT_ADDRESS), rp.slot, 0);
@@ -7150,9 +7147,9 @@ impl<'a> Lower<'a> {
     fn root_bias(&mut self, param: usize) -> Option<V> {
         use super::shader::USER_VIEW_BIAS;
         let rp = *self.x.native.layout.get(param)?;
-        // (Title memory by address where the user-data table is spilled:
-        // [`Lower::root_memory`].)
-        if rp.root != RootType::Descriptor || crate::spill::is_spilled(self.x.native) {
+        // (Title memory by address where the user-data table is spilled, or
+        // with the page table: [`Lower::root_memory`].)
+        if rp.root != RootType::Descriptor || crate::spill::is_spilled(self.x.native) || super::page_table() {
             return None;
         }
         let kind = self

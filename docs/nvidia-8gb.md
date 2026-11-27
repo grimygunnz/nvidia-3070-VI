@@ -352,3 +352,11 @@ changes), half render scale and the title's own upscaler (GPU-side; this PC is C
 bound), Smooth Motion (RTX 40/50 only), `VICTORY_THIN=0` (a whiteout on 50-series).
 Their main speed-up, compares of card copies on the card, this tree already has
 (`VICTORY_CARD_BUFFERS_MIN_KB=64`).
+- **Large blocks of `XMemAllocDefault` watched (`VICTORY_XMEM_WATCHED`, on).** The
+  default allocator took every block from the host heap, which gives large ones memory
+  of their own above 2^40 that Windows does not watch for writes: the 21 MB buffer the
+  card writes every frame was copied whole and sent up whole (21 MB both ways) at each
+  refresh. Blocks of 2 MiB and more are now reservations of their own through
+  `XMemVirtualAlloc` (write-watched, below 2^40). Run xw against xwbase, the full light
+  on: 57.7 ms against 66.6 (17.3 fps against 15.0); that buffer now goes up 0 MB a
+  frame and its refresh is 1.5 ms instead of 2.8; the picture is the same.

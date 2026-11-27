@@ -104,3 +104,17 @@ those copies (`card_steps::copied_read`, as for the line), or meets what it writ
   runs' spread. The submitting thread's time is 43.5 ms of the 57.8 with it off: the
   rest of the frame is bound elsewhere, so taking B off that thread cannot shorten the
   frame by much until that is found (the timeline of a run with it on).
+
+## What bounds the frame with it on (timeline tlpipe, 160 s, 10 frames)
+
+The frame is still the submitting thread's: busy some 45 ms a frame (the work given to
+helpers and done there too 8, the lists' steps 7, the write watch 4, landings 4, copies'
+refreshes 3, title bytes under flights 3) and waiting 17 (for the sender 7, for the
+helpers' refreshes 6, the rest the write watch and landings). The sender is busy some 10
+ms a frame. Refreshing host copies of title memory costs some 65 ms of CPU a frame across
+the six `victory-wide` threads and the submitting one: that, not the card's side, is the
+bulk. The title's 174 MB heap is refreshed in pieces 11 times a frame (5.8 ms).
+
+So taking B off the thread is worth at most its 10 ms, and the waits for the sender
+eat most of it. What would shorten the frame: fewer and smaller refreshes (the heap's
+pieces), and the submitting thread not waiting for its helpers.

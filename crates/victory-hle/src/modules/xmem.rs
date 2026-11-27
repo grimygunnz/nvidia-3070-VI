@@ -693,20 +693,30 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // first mapped or written (`commit`): the title asks for 6.1
     // GiB at once, which a busy host often cannot commit (error 1450).
     // SAFETY: plain section creation.
-    let handle = unsafe {
+    let make = |commit: bool| unsafe {
         CreateFileMappingW(
             INVALID_HANDLE_VALUE,
             std::ptr::null(),
-            // Under Wine a committed section is a sparse file, free until
-            // touched, and committing a reserved one page by page costs a
-            // wineserver request each that scans every range committed so
-            // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
+            PAGE_READWRITE | if commit { SEC_COMMIT } else { SEC_RESERVE },
             (size as u64 >> 32) as u32,
             size as u32,
             std::ptr::null(),
         )
     };
+    // Under Wine a committed section is a sparse file, free until touched,
+    // and committing a reserved one page by page costs a wineserver request
+    // each that scans every range committed so far: commit it whole there.
+    // With `VICTORY_INPLACE_SECTIONS=1` too: only a committed section can be
+    // opened as a heap of the card's, its views then read in place
+    // (`victory_gpu::inplace`). Committing charges the commit limit only;
+    // the pages stay demand-zero until touched. Reserved if refused.
+    let mut committed = on_wine() || sections_in_place();
+    let mut handle = make(committed);
+    if handle.is_null() && committed && !on_wine() {
+        tracing::warn!(n, error = %std::io::Error::last_os_error(), "physical pages not committed whole: reserved instead");
+        committed = false;
+        handle = make(false);
+    }
     if handle.is_null() {
         let error = std::io::Error::last_os_error();
         tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
@@ -721,7 +731,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     );
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
-    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
+    victory_gpu::title_memory_section(handle as usize, size as u64, committed);
     let section = Arc::new(Section {
         handle,
         pages: n,
@@ -746,6 +756,13 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         unsafe { pages.add(index).write(first + index * FRAMES) };
     }
     1
+}
+
+/// `VICTORY_INPLACE_SECTIONS=1`: the title's physical pages are made as
+/// committed sections, which the card's side can open as heaps.
+fn sections_in_place() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_INPLACE_SECTIONS").is_ok_and(|v| v.trim() == "1"))
 }
 
 /// Page numbers count 4 KiB frames, so a 64 KiB page's is a multiple of

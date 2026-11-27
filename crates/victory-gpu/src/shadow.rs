@@ -5077,7 +5077,9 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // memory. Not the big ones `cards` puts in the card's memory: those
         // are read too often to stay in the PC's.
         let big = cards() && (size >= card_limits().0 || card_all());
-        if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
+        // (The title's page sections in place, `VICTORY_INPLACE_SECTIONS`,
+        // big ones too: they are what changes most.)
+        if (!big || crate::inplace::sections()) && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }

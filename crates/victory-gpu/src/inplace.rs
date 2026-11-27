@@ -134,6 +134,37 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
 /// buffers or a title buffer, if [`level`] asks for it and the memory can
 /// be opened; `None` leaves the caller to make a copy, as before.
 pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
+    // The title's page pool, by its sections: what changes most often, and
+    // what costs most to copy (refreshed many times a frame, written in
+    // hundreds of pieces). Memory of other kinds keeps its copies.
+    if sections() && len >= 1 << 24 {
+        static SAID: AtomicU64 = AtomicU64::new(0);
+        if SAID.fetch_add(1, Ordering::Relaxed) < 12 {
+            let v = views();
+            let first = v.views.range(..=start as usize).next_back().map(|(b, w)| (*b, *w));
+            let inside = v.views.range(start as usize..(start + len) as usize).count();
+            let sections: std::collections::BTreeSet<usize> = v.views.range(start as usize..(start + len) as usize).map(|(_, w)| w.1).collect();
+            tracing::info!(
+                start = format_args!("{start:#x}"), len, window,
+                cover = ?cover_in(&v.views, start as usize, len as usize),
+                ?first, inside, sections = sections.len(),
+                "in place by sections: a big ask"
+            );
+        }
+    }
+    if sections() && let Cover::Run(section, offset) = cover(start as usize, len as usize) {
+        let placed = place_in_section(section, offset, len);
+        let at = if window { 0 } else { 2 };
+        if let Some(placed) = &placed {
+            STATS[at].fetch_add(1, Ordering::Relaxed);
+            STATS[at + 1].fetch_add(len, Ordering::Relaxed);
+            let _ = placed;
+        }
+        say();
+        if placed.is_some() || level() == 0 {
+            return placed;
+        }
+    }
     if level() < if window { 1 } else { 2 } {
         return None;
     }
@@ -161,6 +192,59 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
         Err(Some(e)) => {
             if STATS[5].fetch_add(1, Ordering::Relaxed) < 8 {
                 tracing::warn!(start = format_args!("{start:#x}"), len, error = %e, "title memory not opened in place: a copy instead");
+            }
+            None
+        }
+    }
+}
+
+/// `VICTORY_INPLACE_SECTIONS=1`: title memory that is one run of one of
+/// the title's committed page sections (the runtime makes them committed
+/// with this on) is a buffer placed in that section, opened once as a heap
+/// of the card's ([`From::Section`]): no copy, no refresh, no guards of
+/// ours to fault on, whatever view of the pages the title writes through.
+/// The card reads those bytes over the bus.
+pub(crate) fn sections() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_INPLACE_SECTIONS").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// The heaps opened on the title's sections, by handle (`None`: refused).
+static SECTION_HEAPS: std::sync::Mutex<Vec<(usize, Option<ID3D12Heap>)>> = std::sync::Mutex::new(Vec::new());
+
+/// `len` bytes from `offset` of `section` as a buffer in it.
+fn place_in_section(section: usize, offset: u64, len: u64) -> Option<Placed> {
+    let bytes_of = {
+        let v = views();
+        v.sections.iter().find(|s| s.0 == section).filter(|s| s.2).map(|s| s.1)
+    }?;
+    let at = offset & !(K64 as u64 - 1);
+    let bytes = ((offset + len.max(1)).next_multiple_of(K64 as u64) - at).min(bytes_of - at);
+    let host = crate::host::host()?;
+    let heap = {
+        let mut heaps = SECTION_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        match heaps.iter().find(|h| h.0 == section) {
+            Some((_, heap)) => heap.clone(),
+            None => {
+                let heap = open(&host.device, From::Section(section));
+                if let Err(e) = &heap {
+                    tracing::warn!(section = format_args!("{section:#x}"), error = %e, "the title's pages not opened as a heap: copies instead");
+                }
+                let heap = heap.ok();
+                heaps.push((section, heap.clone()));
+                heap
+            }
+        }
+    }?;
+    match place(&host.device, &heap, at, bytes) {
+        Ok(buffer) => {
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (offset - at);
+            Some(Placed { buffer, heap, gpu, bias: offset - at })
+        }
+        Err(e) => {
+            if STATS[5].fetch_add(1, Ordering::Relaxed) < 8 {
+                tracing::warn!(offset, len, error = %e, "a run of the title's pages not placed: a copy instead");
             }
             None
         }
@@ -312,6 +396,8 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
 /// The runtime lets go of a section, and of its handle: no view the title
 /// sees is of it any more, and [`beside`]'s view goes.
 pub fn title_memory_section_gone(section: usize) {
+    // (The heap stays while buffers placed in it do.)
+    SECTION_HEAPS.lock().unwrap_or_else(|e| e.into_inner()).retain(|h| h.0 != section);
     let whole = {
         let mut v = views_mut();
         let at = v.whole.iter().position(|w| w.0 == section);

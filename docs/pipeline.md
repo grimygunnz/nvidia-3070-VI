@@ -135,3 +135,29 @@ pieces), and the submitting thread not waiting for its helpers.
   of it busy (`that thread worked`), whatever waits around it are shortened. The refreshes
   of host copies (some 10,000 a frame, 89 % of them copying nothing) and the lists' steps
   are most of it.
+
+## The title's page sections in place (`VICTORY_INPLACE_SECTIONS=1`, off)
+
+The copies and their tracking emulate on the CPU what the console's GPU does with its
+page table: the title's pool manager maps 64 KiB physical pages at any address, in any
+order. The other way is not to copy: the card reads the title's own pages.
+
+`xmem` makes the title's physical-page sections committed (charge only; the pages stay
+demand-zero until touched; reserved if refused); `inplace::place_for` opens each section
+once as a heap (`OpenExistingHeapFromFileMapping`, locks nothing) and places a buffer at
+the offset of any title memory that is one run of a section, big buffers included. Run
+sec3/sec4 (one pair, 200 s from 120 s):
+
+- 113 title buffers, 145 MB, in place. The 182 MB pool is not: its views are 3 pieces of
+  a section out of order (`Scattered`), and other big buffers are hundreds of one-page
+  views (800 for 50 MB). D3D12 maps GPU addresses to pages in any order only with tiled
+  resources, and tile mappings into an opened section remove the device.
+- The submitting thread: 34.8 ms a frame against 48.7. The card: 36.5 ms against 0.1,
+  reading those buffers over the bus. The frame: 85.1 ms against 66.7.
+
+So in place trades the CPU's copies for the card's reads over PCIe: right for memory the
+title writes much and the card reads little, wrong for what it reads much. Next, if
+taken further: choose by what each buffer costs (bytes the title writes a frame against
+bytes the card reads), and for scattered pages the console's page table in the
+translated shaders (an address through a table of 64 KiB pages into one buffer over the
+whole section), which needs no tiled mapping.

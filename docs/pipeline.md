@@ -118,3 +118,20 @@ bulk. The title's 174 MB heap is refreshed in pieces 11 times a frame (5.8 ms).
 So taking B off the thread is worth at most its 10 ms, and the waits for the sender
 eat most of it. What would shorten the frame: fewer and smaller refreshes (the heap's
 pieces), and the submitting thread not waiting for its helpers.
+
+## Night of 2026-11-26: looks, faults, presents (one pair each, 200 s from 120 s)
+
+- `VICTORY_LOOKS_APART=1` with the pipeline: 64.1 ms against 56.0. Not kept.
+- The title's threads take some 450 write faults a frame on guarded view memory
+  (timeline tlpipe): 56 ms a frame of all their time in the handler, 49 of it waiting
+  for the guards' lock; our copy threads wait 13 ms a frame for it inside
+  `watch::writes`. Spinning for it (`VICTORY_GUARD_SPIN`) halved those waits before and
+  left the frame as it was.
+- The title's render thread waited 14-16 ms a frame in our present for the frame
+  before to be sent. `VICTORY_SUBMIT_FRAMES=2` (never tried before) takes that to 0:
+  55.9 ms against 57.4; with the pipeline as well 56.4 against 58.9 (the same
+  setting without it). Within the runs' spread.
+- What every one of these says: the frame is the submitting thread's work, some 52 ms
+  of it busy (`that thread worked`), whatever waits around it are shortened. The refreshes
+  of host copies (some 10,000 a frame, 89 % of them copying nothing) and the lists' steps
+  are most of it.

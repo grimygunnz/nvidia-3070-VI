@@ -1,8 +1,27 @@
-# On an NVIDIA card with 8 GB: what was measured (2026-11-25 to 26)
+# On an NVIDIA card with 8 GB: what was measured (2026-11-25 to 27)
 
 One PC: RTX 3070 Ti 8 GB (a video-memory budget of about 6.8-7.2 GB as Windows counts
 it), Ryzen 9 5900X (12 cores, 24 threads, all of one kind), 64 GB RAM, Windows 11.
 Diagnostics builds (`--profile diag --features diagnostics`).
+
+## Bus + prepare (2026-11-27)
+
+Series S, `-Profile br`, late frames of `-SkipMenus` runs (chain heat → high2 → looks
+→ prep3):
+
+| Tag | Mean frame | fps | Preparing | Notes |
+|---|---|---|---|---|
+| br-heat | ~49 ms | ~20.6 | — | heat / residency baseline of the day |
+| br-high2 | ~44 ms | ~22.7 | — | `HIGH_NO_BACK`: fetch 31→11 MB, back 21.6→0.9 MB |
+| br-looks | ~43.2 ms | ~23.2 | — | `LOOKS_APART` default on: empty-look wall ~6.5→~2 ms |
+| **br-prep3** | **~41.1 ms** | **~24.3** | **~31 ms** | range-limited `title_written` flush; heap sync before settle |
+
+Not kept: `VICTORY_TEARING` (wet/smear), `ASK_QUIET=5` / gap 16 (slower), parallel
+`GetWriteWatch` groups (ask ms up), `SYNC_PAGES=64` (heaps wait up), page-stream
+`COMPARE_PIECE=4K` (no clear win vs prep3). `VICTORY_PAGE_TABLE` stays off.
+
+Remaining prepare: refreshes that copy ~11 ms (~23 MB title read / ~5 MB differed),
+write-watch ask ~4 ms, card uploads ~3–4 ms, heaps wait ~2–3 ms.
 
 ## How runs are measured
 

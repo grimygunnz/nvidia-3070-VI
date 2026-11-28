@@ -1673,6 +1673,26 @@ pub(crate) fn staged(resource: This, ask: bool) -> Option<(u64, bool)> {
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
 /// unmapped until their pages arrive).
 pub(crate) fn committed(at: *const u8, len: usize) -> bool {
+    if crate::watch::soft().is_some() {
+        let runs = crate::watch::soft_runs(at as usize, len);
+        if runs.is_empty() {
+            return committed_there(at, len);
+        }
+        let (mut from, end) = (at as usize, at as usize + len);
+        for (run, bytes) in runs {
+            if run > from && !committed_there(from as *const u8, run - from) {
+                return false;
+            }
+            from = run + bytes;
+        }
+        return from >= end || committed_there(from as *const u8, end - from);
+    }
+    crate::watch::materialize(at as usize, len);
+    committed_there(at, len)
+}
+
+/// [`committed`], of memory the host has mapped or has not.
+fn committed_there(at: *const u8, len: usize) -> bool {
     if by_query() {
         return committed_by_query(at, len);
     }

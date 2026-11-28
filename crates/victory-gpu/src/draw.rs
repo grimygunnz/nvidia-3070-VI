@@ -1453,7 +1453,7 @@ impl State {
                     // As `root_uav`: the copy brought up to date, and what
                     // shaders store there copied back when the list has run.
                     if let Some(s) = crate::shadow::find(address, 1) {
-                        let len = s.left(address);
+                        let len = s.write_len(address);
                         s.refresh(list, address, len);
                         s.gpu_writes(list, address, len);
                     }
@@ -1912,7 +1912,8 @@ impl State {
             Some(s)
         };
         let ready = |a: u64, s: &std::sync::Arc<crate::shadow::Shadow>| {
-            let len = s.left(a).min(limit);
+            // Heat-shrunk when the remainder is huge (whole pool declares).
+            let len = s.write_len(a).min(limit);
             s.refresh(list, a, len);
             if writes {
                 #[cfg(feature = "diagnostics")]
@@ -1970,7 +1971,7 @@ impl State {
                     // not on 16 bytes got a null view at first: the
                     // builder's counters are at such addresses.)
                     let bias = offset & 15;
-                    host.raw_uav_at(index, &s.buffer, offset - bias, s.left(*a).min(limit) + bias);
+                    host.raw_uav_at(index, &s.buffer, offset - bias, s.write_len(*a).min(limit) + bias);
                 }
                 if shadow.is_none() {
                     host.null_raw_uav_at(index);
@@ -3123,6 +3124,10 @@ impl State {
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
+        if crate::pipeline::skips_rt_skin(self.pipeline as This) {
+            once!("passes that only serve rays are left out (VICTORY_RT_MISS=1, builder off; VICTORY_RT_SKIN, VICTORY_RT_RESOLVE, VICTORY_ACTIVATE_RAYS =1 run them)");
+            return;
+        }
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -4208,7 +4213,9 @@ impl State {
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
         }
-        if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+        if crate::pipeline::skips_rt_skin(self.pipeline as This)
+            || crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs()
+        {
             return false;
         }
         const DRAW: u32 = 0;

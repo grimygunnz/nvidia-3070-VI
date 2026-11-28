@@ -288,6 +288,8 @@ impl Pool {
     }
 
     fn help(&self) {
+        // (The thread that calls `each` waits for this one's share.)
+        let mut priority = crate::cores::Priority::new();
         let mut state = self.state();
         loop {
             let Some((work, i)) = take(&mut state) else {
@@ -310,6 +312,7 @@ impl Pool {
             // SAFETY: counted in `running`, so `each` has not returned.
             let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { (*work.0)(i) }));
             working.end();
+            priority.keep();
             state = self.state();
             state.running -= 1;
             state.panicked |= ran.is_err();
@@ -674,6 +677,8 @@ unsafe fn piece_at(
     // stays; else it is opened once for the piece.
     let mut differing = [true; BLOCK / PAGE + 1];
     let base = title / PAGE;
+    let mut quiet_span: Option<(usize, usize)> = None;
+    let mut quiet_theirs: Option<Vec<usize>> = None;
     if beside.is_none() {
         drop(reading);
         differing.fill(false);
@@ -689,6 +694,12 @@ unsafe fn piece_at(
         };
         let last = differing.iter().rposition(|&d| d).unwrap_or(first);
         let (from, to) = (((base + first) * PAGE).max(title), ((base + last + 1) * PAGE).min(title + end));
+        if crate::watch::quiet_back() && crate::watch::quiet_back_watched() && !copy.is_null() {
+            quiet_theirs = crate::watch::ours_before(from, to - from);
+            if quiet_theirs.is_some() {
+                quiet_span = Some((from, to));
+            }
+        }
         let opening = std::time::Instant::now();
         crate::watch::landing(from, to - from);
         spent(stat::NOTES, opening);
@@ -740,6 +751,11 @@ unsafe fn piece_at(
             }
         }
     });
+    if let (Some((from, to)), Some(theirs)) = (quiet_span, quiet_theirs) {
+        let marks = crate::watch::ours_after(from, to - from);
+        // SAFETY: `copy` is the landing's shadow, held for the job.
+        unsafe { (*copy).holds(&marks, &theirs) };
+    }
     if let Some((from, to)) = span {
         notes.spans.push((from, to - from));
         // Not through a copy that is not to be noted, if that is asked: the

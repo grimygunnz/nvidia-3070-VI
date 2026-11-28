@@ -509,7 +509,7 @@ fn twin_texture(
         TWINS[1].fetch_add(1, Relaxed);
         return None;
     };
-    let _ = crate::host::resident(&host.device, &texture);
+    let _ = crate::host::resident(&host.device, &texture).and_then(|()| crate::host::flush_resident(&host.device));
     crate::host::name(&texture, || {
         format!("depth twin {}x{} f{}", d.width, d.height, d.format)
     });
@@ -570,7 +570,7 @@ fn twin_texture(
             tracing::warn!(error = %e, desc = ?d, "no twin for a depth plane");
         }
         texture.map(|texture| {
-            let _ = crate::host::resident(&host.device, &texture);
+            let _ = crate::host::resident(&host.device, &texture).and_then(|()| crate::host::flush_resident(&host.device));
             crate::host::name(&texture, || {
                 format!("depth plane twin {}x{} f{}", d.width, d.height, d.format)
             });
@@ -1730,8 +1730,7 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
 
 /// The bytes of the card's memory the texture queue leaves free for
 /// render targets and other host copies the host itself writes that are
-/// not made yet: `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (3,072; 0: none, as
-/// before) less what such copies hold now.
+/// not made yet ([`targets_rule`]).
 ///
 /// Measured (runs 193, 197, 198): 652 MB of them before the world, 2,255
 /// to 2,352 MB right after its first frame, 2,800 to 3,100 MB two minutes
@@ -1745,19 +1744,142 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
 /// 238), and the queue was refused from the first world frame on. With
 /// their room kept, the queue stops that much earlier while the world
 /// loads and gets it back as the targets are made.
+///
+/// A fixed 3,072 MB was what those runs needed. With the Series S profile
+/// and the upscaler at 720p the targets came to 1,407-1,445 MB at most
+/// (VI-BR-PORT prison runs): some 1,650 MB stayed kept for targets that never
+/// came and the queue starved for new textures. Dynamic rule: once known,
+/// peak + ¼ (≥384 MB), capped at 3,072. Ported from edsuuu/VI-BR-PORT.
 #[cfg(windows)]
 pub(crate) fn targets_room_kept() -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
-    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let most = *MOST.get_or_init(|| {
-        std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(3072 << 20, |mb| mb.min(8192) << 20)
-    });
-    // Every host texture's bytes less those of the copies the title fills.
+    let now = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
+    let peak = TARGETS_PEAK.fetch_max(now, Relaxed).max(now);
+    let (most, fixed) = targets_most();
+    targets_rule(most, fixed, now, peak, targets_known(), TARGETS_GROWN.load(Relaxed)).0
+}
+
+/// The most kept for targets in all, and whether it was set by hand:
+/// `VICTORY_CARD_ROOM_FOR_TARGETS_MB=<n>` keeps that many in all (0: none);
+/// without it, 3,072 MB at most ([`targets_rule`]).
+#[cfg(windows)]
+fn targets_most() -> (u64, bool) {
+    static MOST: std::sync::OnceLock<(u64, bool)> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        match std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+            Some(mb) => (mb.min(8192) << 20, true),
+            None => (3072 << 20, false),
+        }
+    })
+}
+
+#[cfg(windows)]
+static TARGETS_PEAK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(windows)]
+static TARGETS_GROWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(windows)]
+static WORLD_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Whether a frame with ≥500 draws has been seen (world / cutscene past splash).
+#[cfg(windows)]
+pub(crate) fn world_started() -> bool {
+    WORLD_AT.load(std::sync::atomic::Ordering::Relaxed) != u64::MAX
+}
+
+const TARGETS_SETTLE_FRAMES: u64 = 300;
+const TARGETS_MARGIN_MIN: u64 = 384 << 20;
+const TARGETS_MARGIN_QUARTERS: u64 = 1;
+const TARGETS_GROW_STEP: u64 = 256 << 20;
+
+#[cfg(windows)]
+fn targets_known() -> bool {
+    let world = WORLD_AT.load(std::sync::atomic::Ordering::Relaxed);
+    world != u64::MAX && crate::frame::current().saturating_sub(world) >= TARGETS_SETTLE_FRAMES
+}
+
+/// Which rule set the room kept for targets ([`targets_rule`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TargetsBy {
+    Hand,
+    Unknown,
+    Measured,
+}
+
+/// The room kept for targets not made yet, and the rule that set it.
+pub(crate) fn targets_rule(most: u64, fixed: bool, now: u64, peak: u64, known: bool, grown: u64) -> (u64, TargetsBy) {
+    let peak = peak.max(now);
+    let (all, by) = if fixed {
+        (most, TargetsBy::Hand)
+    } else if !known {
+        (most, TargetsBy::Unknown)
+    } else {
+        let margin = (peak / 4 * TARGETS_MARGIN_QUARTERS).max(TARGETS_MARGIN_MIN);
+        ((peak + margin + grown).min(most), TargetsBy::Measured)
+    };
+    (all.saturating_sub(now), by)
+}
+
+/// At each present: notes the world's first frame, grows the targets' margin
+/// when VRAM use passed the budget, and logs the room for textures.
+#[cfg(windows)]
+pub(crate) fn targets_presented(frame: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    static LAST_DRAWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let drawn = crate::draw::drawn();
+    let before = LAST_DRAWN.swap(drawn, Relaxed);
+    let draws_this = drawn.saturating_sub(before);
+    // While still on the splash / load path (few draws), drain early pipeline
+    // workers so the cutscene does not hitch on cold compiles.
+    if draws_this < 500 {
+        crate::pipeline::make::splash_drain(frame, draws_this);
+    }
+    if draws_this >= 500 && WORLD_AT.compare_exchange(u64::MAX, frame, Relaxed, Relaxed).is_ok() {
+        tracing::info!(frame, "the world's first frame (500 draws or more): what its targets take is measured from here on");
+        crate::pipeline::make::splash_ended(frame);
+    }
+    static SECOND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now_ms = crate::host::now_ms();
+    let second = now_ms / 1000 + 1;
+    if SECOND.swap(second, Relaxed) == second {
+        return;
+    }
+    let Some([budget, used, ..]) = crate::host::host().and_then(|h| h.video_memory()) else {
+        return;
+    };
+    let (most, fixed) = targets_most();
+    if used > budget && !fixed && targets_known() {
+        let grown = TARGETS_GROWN.load(Relaxed);
+        if grown < most {
+            TARGETS_GROWN.store((grown + TARGETS_GROW_STEP).min(most), Relaxed);
+        }
+    }
+    static SAID: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+    let kept = targets_room_kept();
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
-    most.saturating_sub(targets)
+    let (_, by) = targets_rule(most, fixed, targets, TARGETS_PEAK.load(Relaxed), targets_known(), TARGETS_GROWN.load(Relaxed));
+    let last_ms = SAID[0].load(Relaxed);
+    let moved = SAID[1].load(Relaxed).abs_diff(kept) >= 256 << 20;
+    if last_ms != 0 && now_ms.saturating_sub(last_ms) < 60_000 && !(moved && now_ms.saturating_sub(last_ms) >= 5000) {
+        return;
+    }
+    SAID[0].store(now_ms.max(1), Relaxed);
+    SAID[1].store(kept, Relaxed);
+    let mb = |b: u64| b >> 20;
+    tracing::info!(
+        "the card's memory for textures: {} MB in use of a budget of {} MB (the system's count); kept for render targets not made yet {} MB ({:?}: targets hold {} MB now, {} MB at most; {} MB added after the budget was passed; VICTORY_CARD_ROOM_FOR_TARGETS_MB), {} MB for card copies of buffers, {} MB of texture blocks free; room for new textures: {}",
+        mb(used),
+        mb(budget),
+        mb(kept),
+        by,
+        mb(targets),
+        mb(TARGETS_PEAK.load(Relaxed)),
+        mb(TARGETS_GROWN.load(Relaxed)),
+        mb(crate::shadow::card_room_kept()),
+        mb(crate::pool::texture_room()),
+        if room(Some([budget, used, 0, 0])) { "yes" } else { "no" }
+    );
 }
 
 /// [`room`] as it was at most a tenth of a second ago, for a question
@@ -2563,7 +2685,8 @@ fn host_texture_as(
     if !reserved
         && made.is_ok()
         && let Some(t) = &texture
-        && let Err(e) = crate::host::resident(&host.device, t).and_then(|()| crate::host::mapped(&host.device))
+        // Residency flushed + mapped once before the submission that uses it.
+        && let Err(e) = crate::host::resident(&host.device, t)
     {
         tracing::warn!(error = %e, desc = ?d, "a host texture is not resident");
         texture = None;
@@ -3325,6 +3448,24 @@ pub(crate) fn test_buffer(width: u64) -> This {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[test]
+    fn the_room_for_targets_follows_what_they_take_once_known() {
+        const MB: u64 = 1 << 20;
+        let most = 3072 * MB;
+        assert_eq!(targets_rule(most, false, 652 * MB, 652 * MB, false, 0), (2420 * MB, TargetsBy::Unknown));
+        assert_eq!(
+            targets_rule(most, false, 1400 * MB, 1445 * MB, true, 0),
+            ((1445 + 384 - 1400) * MB, TargetsBy::Measured)
+        );
+        assert_eq!(targets_rule(most, false, 2000 * MB, 2400 * MB, true, 0), ((2400 + 600 - 2000) * MB, TargetsBy::Measured));
+        assert_eq!(targets_rule(most, false, 2000 * MB, 2800 * MB, true, 512 * MB).0, (3072 - 2000) * MB);
+        assert_eq!(targets_rule(most, false, 900 * MB, 1445 * MB, true, 0).0, (1445 + 384 - 900) * MB);
+        assert_eq!(targets_rule(most, false, 2500 * MB, 1445 * MB, true, 0).0, (3072 - 2500) * MB);
+        assert_eq!(targets_rule(most, false, 1400 * MB, 1445 * MB, true, 256 * MB).0, (1445 + 384 + 256 - 1400) * MB);
+        assert_eq!(targets_rule(1600 * MB, true, 1400 * MB, 1445 * MB, true, 256 * MB), (200 * MB, TargetsBy::Hand));
+        assert_eq!(targets_rule(0, true, 1400 * MB, 1445 * MB, false, 0).0, 0);
+    }
 
     #[test]
     fn a8_unorm_is_not_in_the_r8_typeless_family() {

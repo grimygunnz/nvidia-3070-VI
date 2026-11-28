@@ -180,6 +180,11 @@ pub extern "system" fn XMemVirtualAlloc(
     if !at.is_null() && !placeholder {
         victory_gpu::title_memory_allocated(at as usize, size);
     }
+    // Write-combined: memory the title's CPU writes and does not read
+    // (`VICTORY_WC_NO_BACK`; trustno1-coder/VIctory-NVIDIA / ProjectLeonida/mandy).
+    if !at.is_null() && asked & 0x400 != 0 {
+        victory_gpu::title_memory_write_combined(at as usize, size);
+    }
     note_protection(asked, kind, flags, at as usize, size);
     at
 }
@@ -650,8 +655,38 @@ pub(crate) fn stream_notice() -> bool {
 /// those take (the host maps, commits and unmaps under it).
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(Default::default);
 
-fn physical() -> MutexGuard<'static, Physical> {
-    PHYSICAL.lock().unwrap_or_else(|e| e.into_inner())
+fn physical() -> Held {
+    let guard = PHYSICAL.lock().unwrap_or_else(|e| e.into_inner());
+    HOLDING.set(true);
+    Held(guard)
+}
+
+thread_local! {
+    /// This thread holds [`PHYSICAL`]: a fault in books-alone title memory
+    /// cannot be made real here ([`materialize_for`]).
+    static HOLDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// [`PHYSICAL`] held, and [`HOLDING`] said while it is.
+struct Held(MutexGuard<'static, Physical>);
+
+impl std::ops::Deref for Held {
+    type Target = Physical;
+    fn deref(&self) -> &Physical {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Held {
+    fn deref_mut(&mut self) -> &mut Physical {
+        &mut self.0
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        HOLDING.set(false);
+    }
 }
 
 /// The title's pages. Apart from the views: DirectStorage looks pages up at
@@ -1241,21 +1276,22 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 /// heap. Page by page; false if a source page is not mapped physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
+    let lazy = soft_views() & SOFT_COPIES != 0;
     let _costed = Costed::begin(None);
     let _busy = Busy::begin();
     let mut physical = physical();
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
     let _changing = victory_gpu::title_memory_remapping();
     unmap(&mut physical, to, len);
+    if from == 0 {
+        return true;
+    }
     for k in (0..len).step_by(PAGE) {
-        if from == 0 {
-            break;
-        }
         let at = from + k;
         let Some(slice) = physical.slice_at(at) else {
             return false;
         };
-        if !map(&mut physical, to + k, PAGE, slice) {
+        if !place(&mut physical, to + k, PAGE, slice, lazy.then_some(Soft::NotedCopies)) {
             return false;
         }
     }
@@ -1362,6 +1398,9 @@ const GROUP: usize = 64;
 /// queue once at a time. In a bench (60,000 views, five threads changing
 /// protections) one thread mapped 1,500 pages a second, eight 30,000.
 fn side_by_side() -> usize {
+    if soft_views() != 0 {
+        return 1;
+    }
     // Diagnostics: 1 and 8 by turns.
     #[cfg(all(windows, feature = "diagnostics"))]
     if let Some(on) = victory_gpu::switched("VICTORY_MAP_THREADS") {
@@ -1496,6 +1535,14 @@ fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
                 }
                 victory_gpu::title_memory_unmapping(op.at, PAGE);
                 physical.holes.remove(&op.at);
+                if unlazy(op.at) {
+                    count(Soft::Gone, 1);
+                    if op.slice.is_none() {
+                        physical.holes.insert(op.at, PAGE);
+                    }
+                    op.own = true;
+                    continue;
+                }
                 (op.had, op.own) = (true, lean());
             }
             // Part of a larger view.
@@ -1821,6 +1868,20 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             victory_gpu::title_memory_splitting(at, size);
         }
         victory_gpu::title_memory_unmapping(at, size);
+        if unlazy(at) {
+            count(Soft::Gone, 1);
+            if at >= base && at + size <= end {
+                physical.holes.insert(at, size);
+            }
+            if at < base {
+                map_lazy(physical, at, base - at, slice.clone(), None);
+            }
+            if at + size > end {
+                let index = slice.index + (end - at) / PAGE;
+                map_lazy(physical, end, at + size - end, Slice { index, ..slice }, None);
+            }
+            continue;
+        }
         // SAFETY: a view we mapped; it becomes a placeholder again.
         let gone = counted(Call::Unmap, || unsafe {
             UnmapViewOfFile2(
@@ -1842,6 +1903,476 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             map(physical, end, at + size - end, Slice { index, ..slice });
         }
     }
+}
+
+/// The title's own mapping calls keep their views in our books alone
+/// ([`soft_views`]).
+const SOFT_POOL: u8 = 1;
+/// The GPU's page-mapping copies do.
+const SOFT_COPIES: u8 = 2;
+
+/// Which of the title's views are kept in our books alone, with no view of
+/// the host's until the title's CPU touches them (`VICTORY_SOFT_VIEWS`; off
+/// unless asked for). `1`: those of the title's own mapping calls
+/// (`XMemMapPhysicalPages`, into its pool) and those of the GPU's
+/// page-mapping copies (`CopyPageMappingsBatchX`, into its tiled heap);
+/// `pool`: the first alone; `copies`: the second alone.
+///
+/// Why: every view of the host's is a call to map it (45 us) and one to
+/// unmap it (93 us), each waiting for a lock of the kernel's that our
+/// guards' protection changes take too. In 143 s of run stream2: 445,503
+/// maps (20.1 s) and 349,175 unmaps (32.6 s); the title's 359,969 mapping
+/// calls took 23.8 s and its 3,294 page-mapping copies 33.7 s, one of them
+/// 467 ms of a frame of 608 (timeline tl.120). A view kept in the books is
+/// one split of a placeholder the first time its addresses are used and no
+/// call after that.
+///
+/// Who needs the bytes at such a view, and how they get them:
+/// - DirectStorage writes the pages by number, through the section's own
+///   view ([`Section::window`]): as before, no view of the title's needed.
+/// - The page-mapping copies take what the pool shows from the books
+///   ([`Physical::slice_at`]): as before.
+/// - The GPU side reads title memory through one function, which takes the
+///   bytes of such a view from the pages ([`soft_read`]), asks which memory
+///   is such a view ([`soft_runs`]) to take it for committed and to read a
+///   texture there through a copy, and guards such a view in its books,
+///   with no protection change (`victory_gpu::SoftViews`).
+/// - The title's CPU, and whatever of ours touches the memory itself: the
+///   access faults, the GPU side's handler (first in the process) makes the
+///   view a mapping of the host's ([`materialize_for`]) and the access is
+///   made again. From then on it is a view as before, until the title
+///   unmaps it. What that handler does not see asks first: our writes
+///   through the kernel, the kernel's writes the runtime announces (file
+///   reads, DirectStorage's memory destinations), the title's
+///   `XMemVirtualQuery`, `VirtualFree` and `XMemVirtualAlloc` there, and,
+///   with this switch, its `VirtualQuery` and `VirtualProtect`
+///   ([`title_virtual_query`]). Not covered: another call of the host's
+///   that the title makes itself with such memory as an argument.
+///
+/// What it differs in from `VICTORY_LAZY_VIEWS=1` (2 fps in run xw-lazy,
+/// 2.4 to 3.4 GB of copies a frame): there the GPU side made a lazy view
+/// real whenever it guarded a range (every refresh of a copy or texture
+/// over it), and a view guarded together with a lazy view of the same page
+/// was never clean, since the host refused to protect the placeholder; and
+/// only the title's own calls mapped lazily. Here a view in the books is
+/// guarded in the books, read from the pages, and the copies' views are
+/// kept there too.
+///
+/// What a run must show (the streaming log's M line, and a line of the log
+/// every 10 s): how many views were made real, and by whose touch. If the
+/// title's code touches most of them, nothing is gained (a fault and a map
+/// where a map was).
+///
+/// With it one thread maps (`VICTORY_MAP_THREADS` counts as 1): mapping
+/// side by side maps views of the host's.
+fn soft_views() -> u8 {
+    static ON: LazyLock<u8> = LazyLock::new(|| {
+        let which = match std::env::var("VICTORY_SOFT_VIEWS").as_deref().map(str::trim) {
+            Ok("1") => SOFT_POOL | SOFT_COPIES,
+            Ok("pool") => SOFT_POOL,
+            Ok("copies") => SOFT_COPIES,
+            _ => 0,
+        };
+        if which != 0 {
+            use_soft_views();
+            let said = std::thread::Builder::new().name("victory-soft-views".into()).spawn(|| {
+                let mut before = ([0; SOFT_FIELDS], [0; 2]);
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(10));
+                    if let Some(line) = soft_line(&mut before, 10) {
+                        tracing::info!("{line}");
+                    }
+                }
+            });
+            tracing::info!(
+                pool = which & SOFT_POOL != 0,
+                copies = which & SOFT_COPIES != 0,
+                line = said.is_ok(),
+                "title views are kept in the books alone until the title's CPU touches them (VICTORY_SOFT_VIEWS)"
+            );
+        }
+        which
+    });
+    *ON
+}
+
+/// Tells the GPU side how views in our books alone are read, asked about
+/// and made real ([`soft_views`]).
+fn use_soft_views() {
+    victory_gpu::use_soft_views(victory_gpu::SoftViews {
+        materialize: |at, len| materialize_for(at, len, Touch::Asked),
+        fault: |at, code| materialize_for(at, 1, Touch::Fault(code)),
+        read: soft_read,
+        runs: soft_runs,
+    });
+}
+
+/// The views in our books that are no host mapping yet: address, bytes and
+/// what they show. Written with [`PHYSICAL`] held (after it); read without
+/// it, so that the many questions and reads of the GPU side about title
+/// memory cost no wait behind a mapping call.
+static LAZY: LazyLock<RwLock<BTreeMap<usize, (usize, Slice)>>> = LazyLock::new(Default::default);
+
+/// How many views [`LAZY`] holds: none, and nothing is asked of it.
+static LAZY_N: AtomicUsize = AtomicUsize::new(0);
+
+/// How many views in [`LAZY`] touch each 256 MiB of the first 2^40 bytes
+/// (where the title's memory is): what lies in a piece with none (the
+/// title's heaps, which the GPU side reads far more often than its views)
+/// is no question to [`LAZY`], which costs a lock and a search.
+static LAZY_AT: [std::sync::atomic::AtomicU32; 1 << 12] = [const { std::sync::atomic::AtomicU32::new(0) }; 1 << 12];
+
+/// The pieces of [`LAZY_AT`], as a shift of the address.
+const LAZY_PIECE: u32 = 28;
+
+/// Notes in [`LAZY_AT`] that a view at `[base, base + len)` is in [`LAZY`]
+/// (`there`), or no more.
+fn lazy_at(base: usize, len: usize, there: bool) {
+    for piece in base >> LAZY_PIECE..=(base + len.max(1) - 1) >> LAZY_PIECE {
+        match LAZY_AT.get(piece) {
+            Some(n) if there => n.fetch_add(1, Ordering::AcqRel),
+            Some(n) => n.fetch_sub(1, Ordering::AcqRel),
+            None => break,
+        };
+    }
+}
+
+/// Whether a view in [`LAZY`] may overlap `[at, at + len)`.
+fn maybe_lazy(at: usize, len: usize) -> bool {
+    if LAZY_N.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    let (first, last) = (at >> LAZY_PIECE, at.saturating_add(len.max(1) - 1) >> LAZY_PIECE);
+    // (A range over many pieces, or past them: [`LAZY`] says.)
+    last - first >= 16 || last >= LAZY_AT.len() || LAZY_AT[first..=last].iter().any(|n| n.load(Ordering::Acquire) != 0)
+}
+
+/// What is counted of the views in our books alone, since the start: the
+/// fields of the streaming log's M line after the mapping costs, in this
+/// order (there since the last line), then how many there are now.
+#[derive(Clone, Copy)]
+enum Soft {
+    /// Views noted with no view of the host's.
+    Noted = 0,
+    /// Let go before anything touched them: no map, no unmap.
+    Gone = 1,
+    /// Made views of the host's.
+    Real = 2,
+    /// Of the noted: by the title's own mapping calls.
+    NotedPool = 3,
+    /// By the GPU's page-mapping copies.
+    NotedCopies = 4,
+    /// Of those made real: by a fault of code in the title's main image.
+    FaultTitle = 5,
+    /// By a fault of other code (ours, a library's, the system's).
+    FaultOther = 6,
+    /// Asked for by the GPU side ahead of a touch through the kernel.
+    Asked = 7,
+    /// By a call of the title's about the memory.
+    TitleCall = 8,
+    /// Reads of the GPU side served from the pages.
+    Reads = 9,
+    /// Their bytes.
+    ReadBytes = 10,
+}
+
+const SOFT_FIELDS: usize = 11;
+
+static SOFT_N: [AtomicU64; SOFT_FIELDS] = [const { AtomicU64::new(0) }; SOFT_FIELDS];
+
+fn count(what: Soft, n: u64) {
+    SOFT_N[what as usize].fetch_add(n, Ordering::Relaxed);
+}
+
+/// [`SOFT_N`] since `before` held it, which holds it now.
+fn soft_since(before: &mut [u64; SOFT_FIELDS]) -> [u64; SOFT_FIELDS] {
+    let now: [u64; SOFT_FIELDS] = std::array::from_fn(|i| SOFT_N[i].load(Ordering::Relaxed));
+    let since = std::array::from_fn(|i| now[i].wrapping_sub(before[i]));
+    *before = now;
+    since
+}
+
+/// The last access that made a view real by a fault: its address and the
+/// code's, for a fault of the title's main image and for one of other code
+/// (0: none yet). Said in the log's line, not from the fault handler.
+static LAST_FAULT: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
+
+/// The log's line about the views in our books alone over the last
+/// `seconds` (since `before` held the counts), or `None` if there was
+/// nothing to say.
+fn soft_line(before: &mut ([u64; SOFT_FIELDS], [u64; 2]), seconds: u64) -> Option<String> {
+    let n = soft_since(&mut before.0);
+    let guards = victory_gpu::soft_view_guards();
+    let guarded = [guards[0].wrapping_sub(before.1[0]), guards[1].wrapping_sub(before.1[1])];
+    before.1 = guards;
+    let now = LAZY_N.load(Ordering::Relaxed);
+    if n.iter().all(|&n| n == 0) && now == 0 {
+        return None;
+    }
+    let of = |what: Soft| n[what as usize];
+    let image = crate::runtime::main_image().unwrap_or(0);
+    let last = |i: usize| {
+        let (at, code) = (LAST_FAULT[i].load(Ordering::Relaxed), LAST_FAULT[i + 1].load(Ordering::Relaxed));
+        match (at, i) {
+            (0, _) => String::new(),
+            (_, 0) => format!(" (the last at {at:#x}, code title+{:#x})", code.wrapping_sub(image)),
+            _ => format!(" (the last at {at:#x}, code {code:#x})"),
+        }
+    };
+    Some(format!(
+        "title views kept in the books alone (VICTORY_SOFT_VIEWS), last {seconds} s: {} noted with no view of the host's ({} by the title's mapping calls, {} by page-mapping copies), \
+         {} let go untouched (no map, no unmap); {} made views of the host's: {} by a fault of the title's code{}, {} by a fault of other code{}, \
+         {} asked for by the GPU side, {} by a call of the title's; {} reads of the GPU side served from the pages ({} MB); \
+         guarded in the books: {} blocks, {} more as other views of guarded pages; {now} such views now",
+        of(Soft::Noted),
+        of(Soft::NotedPool),
+        of(Soft::NotedCopies),
+        of(Soft::Gone),
+        of(Soft::Real),
+        of(Soft::FaultTitle),
+        last(0),
+        of(Soft::FaultOther),
+        last(2),
+        of(Soft::Asked),
+        of(Soft::TitleCall),
+        of(Soft::Reads),
+        of(Soft::ReadBytes) >> 20,
+        guarded[0],
+        guarded[1],
+    ))
+}
+
+/// Takes the view at `at` out of [`LAZY`]; whether it was lazy.
+fn unlazy(at: usize) -> bool {
+    if LAZY_N.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    let gone = LAZY.write().unwrap_or_else(|e| e.into_inner()).remove(&at);
+    if let Some((size, _)) = &gone {
+        lazy_at(at, *size, false);
+        LAZY_N.fetch_sub(1, Ordering::AcqRel);
+    }
+    gone.is_some()
+}
+
+/// [`map`], in the books alone ([`lazy_views`], [`soft_views`]): the
+/// addresses become one placeholder of their own, as the view would leave
+/// them, and the view is noted and told of; no host view yet. Where they
+/// cannot be made one placeholder, the view is mapped now, as [`map`] does.
+/// `who`: whose view it is, for the counts (`None`: what stays of one that
+/// was cut).
+fn map_lazy(physical: &mut Physical, base: usize, len: usize, slice: Slice, who: Option<Soft>) -> bool {
+    // The pages are committed now, as mapping a view commits them: the GPU
+    // side reads and writes them through views of its own of the section
+    // (ours, [`soft_read`]; its own, where it puts bytes in beside a guard),
+    // and a page nothing has written yet would fault there. Through the
+    // section's view, once a page ([`Section::window`]); without that view
+    // (`VICTORY_SECTION_WINDOW=0`) a view of the host's, as before.
+    if slice.section.window(slice.index, len / PAGE).is_none() {
+        return map(physical, base, len, slice);
+    }
+    let own = physical.holes.remove(&base) == Some(len);
+    if !own {
+        split(base, len);
+        if !one_placeholder_there(base, len) {
+            return map(physical, base, len, slice);
+        }
+    }
+    // Known as in the books alone before the GPU side is told of the view:
+    // a refresh that guards it in between would find a placeholder of the
+    // host's, take the block for not there, and leave it out of its copies
+    // until the next mapping there.
+    lazy_at(base, len, true);
+    match LAZY.write().unwrap_or_else(|e| e.into_inner()).insert(base, (len, slice.clone())) {
+        // (None was there: `unmap` took it out. Counted right all the same.)
+        Some((before, _)) => lazy_at(base, before, false),
+        None => {
+            LAZY_N.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+    shown_mut().note(base, len, &slice);
+    victory_gpu::title_memory_remapped(base, len);
+    victory_gpu::title_memory_view(base, len, slice.section.handle as usize, (slice.index * PAGE) as u64);
+    physical.views.insert(base, (len, slice));
+    if let Some(who) = who {
+        count(Soft::Noted, 1);
+        count(who, 1);
+    }
+    true
+}
+
+/// [`map`], or [`map_lazy`] for `lazy`.
+fn place(physical: &mut Physical, base: usize, len: usize, slice: Slice, lazy: Option<Soft>) -> bool {
+    match lazy {
+        Some(who) => map_lazy(physical, base, len, slice, Some(who)),
+        None => map(physical, base, len, slice),
+    }
+}
+
+/// For the GPU side (`victory_gpu::SoftViews::read`): if a view in our
+/// books alone holds `at`, its bytes from there on, to its end or `len` at
+/// most, are copied from the pages to `to`: `(true, bytes copied)`. Else
+/// `(false, n)`: the next `n` bytes, `len` at most, are in no such view.
+/// (A view whose section has no view of ours, [`Section::window`], is made
+/// a mapping of the host's and answered as the second.)
+fn soft_read(at: usize, to: *mut u8, len: usize) -> (bool, usize) {
+    if len == 0 || !maybe_lazy(at, len) {
+        return (false, len);
+    }
+    let found = {
+        let lazy = LAZY.read().unwrap_or_else(|e| e.into_inner());
+        match lazy.range(..=at).next_back().filter(|(base, view)| at < **base + view.0) {
+            Some((&base, (size, slice))) => Ok((base, *size, slice.clone())),
+            None => Err(lazy.range(at..).next().map_or(len, |(&next, _)| (next - at).min(len))),
+        }
+    };
+    let (base, size, slice) = match found {
+        Ok(view) => view,
+        Err(n) => return (false, n),
+    };
+    let n = (base + size - at).min(len);
+    let (first, within) = ((at - base) / PAGE, (at - base) % PAGE);
+    // Committed, as the view would be when mapped: a page nothing wrote
+    // reads as zeros, as it would there. (The section is held: its view
+    // stands while the bytes are copied, whatever the title unmaps.)
+    let Some(window) = slice.section.window(slice.index + first, (within + n).div_ceil(PAGE)) else {
+        materialize_for(at, n, Touch::Asked);
+        return (false, n);
+    };
+    // SAFETY: `n` committed bytes of the section's view; the caller's `to`
+    // holds as many. The title's writes to the pages race as on the console.
+    unsafe { std::ptr::copy_nonoverlapping((window + within) as *const u8, to, n) };
+    count(Soft::Reads, 1);
+    count(Soft::ReadBytes, n as u64);
+    (true, n)
+}
+
+/// For the GPU side (`victory_gpu::SoftViews::runs`): the parts of
+/// `[at, at + len)` that views in our books alone show, in order, those
+/// that touch as one: (address, bytes).
+fn soft_runs(at: usize, len: usize) -> Vec<(usize, usize)> {
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    if len == 0 || !maybe_lazy(at, len) {
+        return runs;
+    }
+    let end = at.saturating_add(len);
+    let lazy = LAZY.read().unwrap_or_else(|e| e.into_inner());
+    let first = lazy.range(..=at).next_back().filter(|(base, view)| **base + view.0 > at).map(|(&base, view)| (base, view.0));
+    let rest = lazy.range(at.saturating_add(1)..end.max(at.saturating_add(1))).map(|(&base, view)| (base, view.0));
+    for (base, size) in first.into_iter().chain(rest) {
+        let (from, to) = (base.max(at), (base + size).min(end));
+        match runs.last_mut() {
+            Some((start, bytes)) if *start + *bytes == from => *bytes += to - from,
+            _ => runs.push((from, to - from)),
+        }
+    }
+    runs
+}
+
+/// What made a view in our books alone a view of the host's.
+#[derive(Clone, Copy)]
+enum Touch {
+    /// An access that faulted, of the code at this address.
+    Fault(usize),
+    /// The GPU side, ahead of a touch through the kernel.
+    Asked,
+    /// A call of the title's about the memory.
+    TitleCall,
+}
+
+/// Whether `code` lies in the title's main image.
+fn title_code(code: usize) -> bool {
+    static SIZE: AtomicUsize = AtomicUsize::new(0);
+    let Some(base) = crate::runtime::main_image() else {
+        return false;
+    };
+    let mut size = SIZE.load(Ordering::Relaxed);
+    if size == 0 {
+        // SAFETY: a mapped image: its headers are there (the DOS header's
+        // offset of the PE header, and that header's size of the image).
+        size = unsafe {
+            let pe = base + ((base + 0x3c) as *const u32).read_unaligned() as usize;
+            ((pe + 0x50) as *const u32).read_unaligned() as usize
+        };
+        SIZE.store(size, Ordering::Relaxed);
+    }
+    (base..base + size).contains(&code)
+}
+
+/// Whether `[base, base + len)` is one placeholder, exactly (Windows asked).
+fn one_placeholder_there(base: usize, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::VirtualQuery;
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(base as *const c_void, &mut info, size_of_val(&info)) };
+    n != 0
+        && info.State == MEM_RESERVE
+        && info.AllocationBase as usize == base
+        && info.BaseAddress as usize == base
+        && info.RegionSize == len
+}
+
+/// Makes the lazy views ([`lazy_views`]) that overlap `[at, at + len)` host
+/// views; whether there were any and all of them could be made (then an
+/// access that faulted there is made again). For the GPU side's fault
+/// handler and its other touches of title memory, and the title's calls
+/// below. Not on a thread that holds the views (one of our mapping calls
+/// touching title memory: never, by design).
+fn materialize(at: usize, len: usize) -> bool {
+    materialize_for(at, len, Touch::Asked)
+}
+
+/// [`materialize`]; `touch`: what asks, for the counts.
+fn materialize_for(at: usize, len: usize, touch: Touch) -> bool {
+    if !maybe_lazy(at, len.max(1)) {
+        return false;
+    }
+    let end = at.saturating_add(len.max(1));
+    let overlapping = |lazy: &BTreeMap<usize, (usize, Slice)>| -> Vec<usize> {
+        lazy.range(..end).rev().take_while(|&(&base, view)| base + view.0 > at).map(|(&base, _)| base).collect()
+    };
+    {
+        let lazy = LAZY.read().unwrap_or_else(|e| e.into_inner());
+        if lazy.is_empty() || overlapping(&lazy).is_empty() {
+            return false;
+        }
+    }
+    if HOLDING.get() {
+        return false;
+    }
+    let physical = physical();
+    let bases = overlapping(&LAZY.read().unwrap_or_else(|e| e.into_inner()));
+    let mut all = !bases.is_empty();
+    for base in bases {
+        let Some((size, slice)) = physical.views.get(&base).cloned() else {
+            unlazy(base);
+            all = false;
+            continue;
+        };
+        // Its own placeholder is there ([`map_lazy`]).
+        let made = show(base, size, &slice, true);
+        unlazy(base);
+        // Read-write, and there: the title writes through it from now on
+        // with no fault. What the GPU side guarded of it in its books, and
+        // the other views of its pages with it, counts as written.
+        victory_gpu::title_memory_made_real(base, size);
+        count(Soft::Real, 1);
+        match touch {
+            Touch::Fault(code) => {
+                let title = title_code(code);
+                count(if title { Soft::FaultTitle } else { Soft::FaultOther }, 1);
+                let last = if title { 0 } else { 2 };
+                LAST_FAULT[last].store(at, Ordering::Relaxed);
+                LAST_FAULT[last + 1].store(code, Ordering::Relaxed);
+            }
+            Touch::Asked => count(Soft::Asked, 1),
+            Touch::TitleCall => count(Soft::TitleCall, 1),
+        }
+        all &= made;
+    }
+    drop(physical);
+    all
 }
 
 /// The oldest layout we know; newer titles pass other flag values (Minecraft
@@ -1934,6 +2465,7 @@ pub extern "system" fn XMemTransferMemory(kind: u32, size: usize) -> BOOL {
 /// first: the address may be other memory's the moment it is free.
 extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u32) -> BOOL {
     const MEM_COALESCE_PLACEHOLDERS: u32 = 1;
+    materialize_for(address as usize, size, Touch::TitleCall);
     // Splitting and joining placeholders changes nothing they show.
     if kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) == 0 {
         victory_gpu::title_memory_freed(address as usize, size);
@@ -1942,11 +2474,32 @@ extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u
     unsafe { VirtualFree(address, size, kind) }
 }
 
+/// The title's own `VirtualQuery`, while views are kept in the books alone.
+extern "system" fn title_virtual_query(address: *const c_void, out: *mut MEMORY_BASIC_INFORMATION, size: usize) -> usize {
+    use windows_sys::Win32::System::Memory::VirtualQuery;
+    materialize_for(address as usize, 1, Touch::TitleCall);
+    // SAFETY: the title's own arguments.
+    unsafe { VirtualQuery(address, out, size) }
+}
+
+/// The title's own `VirtualProtect`, as [`title_virtual_query`].
+extern "system" fn title_virtual_protect(address: *const c_void, size: usize, protect: u32, old: *mut u32) -> BOOL {
+    use windows_sys::Win32::System::Memory::VirtualProtect;
+    materialize_for(address as usize, size, Touch::TitleCall);
+    // SAFETY: the title's own arguments.
+    unsafe { VirtualProtect(address, size, protect, old) }
+}
+
 pub(crate) fn module() -> HleModule {
+    let soft = std::env::var_os("VICTORY_SOFT_VIEWS").is_some_and(|v| v != "0");
+    let asks = [
+        crate::HleExport { name: "VirtualQuery", address: title_virtual_query as *const () as usize },
+        crate::HleExport { name: "VirtualProtect", address: title_virtual_protect as *const () as usize },
+    ];
     HleModule {
         name: "xmem",
         dlls: &["xmem.dll", "kernel32.dll", "kernelbase.dll", "api-ms-win-core-memory-*"],
-        exports: vec![
+        exports: soft.then_some(asks).into_iter().flatten().chain([
             crate::HleExport { name: "VirtualFree", address: title_virtual_free as *const () as usize },
             hle_export!(XMemAlloc),
             hle_export!(XMemFree),
@@ -1961,7 +2514,8 @@ pub(crate) fn module() -> HleModule {
             hle_export!(XMemVirtualQuery),
             hle_export!(XMemGetWorkingSetStatistics),
             hle_export!(XMemTransferMemory),
-        ],
+        ])
+        .collect(),
     }
 }
 

@@ -62,8 +62,19 @@ pub(super) struct Placed {
 }
 
 impl Placed {
+    /// Whether the copy's bytes are the title's own although flights in the air (`written`) declare them
+    /// (`super::placed_is_titles`): the destination by what has landed there, and the source either not
+    /// declared or the title's by the rule for fills (`super::fill_is_titles`).
+    pub(super) fn titles(&self, written: &[(usize, usize)]) -> bool {
+        super::placed_is_titles(self.dst, self.len)
+            && (!touches(written, self.src, self.src + self.len) || super::fill_is_titles(self.src, self.len))
+    }
+
     /// Whether flights that write `written` are waited for.
     pub(super) fn waits(&self, written: &[(usize, usize)]) -> Waits {
+        if self.titles(written) {
+            return Waits::No;
+        }
         let source = touches(written, self.src, self.src + self.len);
         if source && self.from.is_some() {
             return Waits::Yes;
@@ -76,10 +87,12 @@ impl Placed {
 
     /// At submission, in the order of the steps: the list's upload memory
     /// takes the source's bytes and, if `free` (no flight in the air may write
-    /// source or destination), title memory at the destination does. Gives
-    /// the bytes if it took them.
-    pub(super) fn prepare(&self, free: bool) -> Option<Vec<u8>> {
-        if !free && self.from.is_none() {
+    /// source or destination) or `titles` ([`titles`]), title memory at the
+    /// destination does. Gives the bytes if it took them for a free copy
+    /// (titles leave the reference alone so an in-flight snapshot is not
+    /// overwritten).
+    pub(super) fn prepare(&self, free: bool, titles: bool) -> Option<Vec<u8>> {
+        if !free && !titles && self.from.is_none() {
             return None;
         }
         let mut bytes = vec![0u8; self.len];
@@ -89,11 +102,14 @@ impl Placed {
             // SAFETY: the list's own upload memory of that many bytes.
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), to as *mut u8, self.len) };
         }
-        if !free {
+        if !free && !titles {
             return None;
         }
         copy_mapped(self.dst as *mut u8, bytes.as_ptr(), self.len, true);
         crate::watch::wrote(self.dst, self.len);
+        if !free {
+            return None;
+        }
         // Title memory that is not all there was left alone.
         let mut there = vec![0u8; self.len];
         (read_into(self.dst as *const u8, &mut there) && there == bytes).then_some(bytes)

@@ -2,12 +2,13 @@
 //! default; F3 shows and hides it while our window has the focus): white
 //! text on a black box in the upper left corner of what is shown, so that a
 //! screenshot carries them, with what it costs itself on the submitting
-//! thread. Made again twice a second from the counters of
-//! the frame-rate line, memory and textures; a frame itself only copies the
-//! box out of a buffer in the card's memory. Copied onto the swap chain's
-//! buffer, behind the title's picture: saved frames and the frame recorder
-//! see the title's own.
+//! thread. Made again twice a second from the counters of the frame-rate
+//! line, RAM / VRAM / commit, resolution, RT, lighting, shaders and
+//! textures; a frame itself only copies the box out of a buffer in the
+//! card's memory. Copied onto the swap chain's buffer, behind the title's
+//! picture: saved frames and the frame recorder see the title's own.
 
+use std::mem::size_of;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -26,8 +27,8 @@ const EVERY: Duration = Duration::from_millis(500);
 const GLYPH: (u32, u32) = (5, 7);
 const CELL: (u32, u32) = (6, 9);
 /// Characters in a line, lines, and the box's rim in dots.
-const COLUMNS: u32 = 40;
-const LINES: u32 = 9;
+const COLUMNS: u32 = 48;
+const LINES: u32 = 14;
 const RIM: u32 = 3;
 
 /// The texts are put into one of these in turn: the card reads the others,
@@ -205,23 +206,85 @@ impl Counters {
     }
 }
 
+/// Process private (commit) and working set, then system commit used / limit, in bytes.
+fn memory_bytes() -> (u64, u64, u64, u64) {
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut c = PROCESS_MEMORY_COUNTERS {
+        cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: our own process and a sized structure.
+    unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+    let mut info = PERFORMANCE_INFORMATION {
+        cb: size_of::<PERFORMANCE_INFORMATION>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: a sized structure the call fills.
+    let (commit, limit) = if unsafe { K32GetPerformanceInfo(&mut info, info.cb) } != 0 {
+        (info.CommitTotal.saturating_mul(info.PageSize), info.CommitLimit.saturating_mul(info.PageSize))
+    } else {
+        (0, 0)
+    };
+    (c.PagefileUsage as u64, c.WorkingSetSize as u64, commit as u64, limit as u64)
+}
+
+/// RT / BVH / ambient lighting as short panel words (from switches, not live builder state).
+fn rt_and_light() -> (String, String) {
+    let miss = victory_shader::emit::rt_miss();
+    let bvh = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
+    let rt = match (miss, bvh) {
+        (true, true) => "RT MISS BVH ON",
+        (true, false) => "RT MISS BVH OFF",
+        (false, true) => "RT ON BVH ON",
+        (false, false) => "RT ON BVH OFF",
+    };
+    let light = match std::env::var("VICTORY_AMBIENT").ok().as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        None | Some("0") => "LIGHT TITLE".into(),
+        Some(set) => {
+            // Glyph set has no ':'; show constant 0.1 0.5 as spaces.
+            let set = set.replace(':', " ");
+            let air = std::env::var("VICTORY_AMBIENT_AIR").ok().filter(|v| !v.is_empty() && v != "0").unwrap_or_default();
+            if air.is_empty() {
+                format!("LIGHT {set}")
+            } else {
+                format!("LIGHT {set} AIR {air}")
+            }
+        }
+    };
+    (rt.into(), light)
+}
+
 /// The text. `c`: [`Counters`] per frame, `ms` a frame's time, `worst` the
 /// longest frame's, `cost` what this takes of a frame, in microseconds.
-fn text(c: &[f64; COUNTERS], ms: f64, worst: f64, cost: f64, host: &Host) -> Vec<String> {
+fn text(c: &[f64; COUNTERS], ms: f64, worst: f64, cost: f64, host: &Host, width: u32, height: u32) -> Vec<String> {
     let gb = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
-    let (working, private) = crate::copystat::process_memory();
+    let (private, working, commit, commit_limit) = memory_bytes();
     let [budget, used, _, shared] = host.video_memory().unwrap_or_default();
     let idle = (c[1] / 1e3).min(ms);
+    let (rt, light) = rt_and_light();
+    let shaders = crate::pipeline::kept();
+    let pso_wait = crate::pipeline::make::waiting();
+    let tex_up = crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed);
+    let tex_mb = crate::draw::HEAP_TEXTURE_BYTES.load(Ordering::Relaxed) >> 20;
+    let tex_wait = crate::draw::HEAP_TEXTURES_WAITING.load(Ordering::Relaxed);
+    let host_tex = crate::resource::HOST_TEXTURES[0].load(Ordering::Relaxed);
+    let host_tex_mb = crate::resource::HOST_TEXTURES[1].load(Ordering::Relaxed) >> 20;
     vec![
         format!("FPS {:.1}  FRAME {ms:.1} MS  LONGEST {worst:.0}", 1e3 / ms.max(0.001)),
-        format!("DRAWS {:.0}  DROPPED {:.0}", c[10], c[8]),
-        format!("SUBMIT BUSY {:.1}  WAITS FOR GPU {:.1}", c[0] / 1e3, c[3] / 1e3),
-        format!("GPU BUSY {:.1}  IDLE BEHIND US {:.1}", ms - idle, c[2] / 1e3),
-        format!("RECORDING {:.0} MS  COPY BACK {:.1}", c[9] / 1e6, c[5] / 1e3),
-        format!("MB UP {:.0}  TEXTURES {:.0}  BACK {:.0}", c[7] / 1e6, c[4] / 1e6, c[6] / 1e6),
-        format!("RAM {:.1} GB  IN MEMORY {:.1}", gb(private), gb(working)),
+        format!("RES {width}X{height}  DRAWS {:.0}  DROP {:.0}", c[10], c[8]),
+        format!("{rt}"),
+        format!("{light}"),
+        format!("SUBMIT {:.1}  GPU WAIT {:.1}  BUSY {:.1}", c[0] / 1e3, c[3] / 1e3, ms - idle),
+        format!("COPY BACK {:.1}  MB UP {:.0}  TEX {:.0}", c[5] / 1e3, c[7] / 1e6, c[4] / 1e6),
+        format!("RAM {:.1} GB  WS {:.1}  COMMIT {:.1}/{:.0}", gb(private), gb(working), gb(commit), gb(commit_limit)),
         format!("VRAM {:.1}/{:.1} GB  SHARED {:.1}", gb(used), gb(budget), gb(shared)),
-        format!("THIS PANEL {:.0} US A FRAME", cost),
+        format!("SHADERS {}  PSO WAIT {pso_wait}", shaders[0]),
+        format!("TEX {tex_up} / {tex_mb} MB  WAIT {tex_wait}"),
+        format!("HOST TEX {host_tex} / {host_tex_mb} MB"),
+        format!("PANEL {:.0} US/FRAME", cost),
     ]
 }
 
@@ -294,6 +357,8 @@ pub(super) struct Panel {
     changed: bool,
     buffers: Option<Buffers>,
     failed: bool,
+    /// Last swap-chain size, for the RES line.
+    size: (u32, u32),
 }
 
 impl Panel {
@@ -310,6 +375,7 @@ impl Panel {
             changed: false,
             buffers: None,
             failed: false,
+            size: (0, 0),
         }
     }
 
@@ -342,7 +408,8 @@ impl Panel {
         let c = counters.since(self.before, frames);
         self.before = counters;
         let cost = self.cost.as_secs_f64() * 1e6 / frames;
-        self.lines = text(&c, elapsed.as_secs_f64() * 1e3 / frames, self.worst, cost, host);
+        let (width, height) = self.size;
+        self.lines = text(&c, elapsed.as_secs_f64() * 1e3 / frames, self.worst, cost, host, width, height);
         self.changed = true;
         (self.since, self.frames, self.worst) = (now, 0, 0.0);
         self.cost = now.elapsed();
@@ -359,8 +426,10 @@ impl Panel {
         format: DXGI_FORMAT,
     ) {
         if !shown().load(Ordering::Relaxed) || self.lines.is_empty() || self.failed {
+            self.size = (width, height);
             return;
         }
+        self.size = (width, height);
         let began = Instant::now();
         // Not the title's: the frame recorder leaves it out.
         let _ours = crate::replay::record::unrecorded();

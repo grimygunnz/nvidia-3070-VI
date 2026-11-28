@@ -495,21 +495,191 @@ pub(super) fn cut_for(runs: &[&HostList]) -> Option<usize> {
     (place(reader)? >= cut).then_some(cut)
 }
 
-/// Whether every page of `[from, to)` can be read (through the kernel:
-/// asking Windows walks the page tables, milliseconds in the title's heap).
-/// `known`: pages that could be, of the same submission: its fills' places
-/// lie eight to a page, and each was read whole to find out.
-fn mapped(from: usize, to: usize, known: &mut HashMap<usize, ()>) -> bool {
-    const PAGE: usize = 4096;
-    (from / PAGE..to.div_ceil(PAGE)).all(|page| {
-        known.contains_key(&page) || {
-            let there = read_into((page * PAGE).max(from) as *const u8, &mut [0]);
-            if there {
-                known.insert(page, ());
-            }
-            there
+/// Cross-submission cache of verified readable memory regions and pages, using
+/// a single `VirtualQuery` to verify whole committed spans (e.g. the 174 MB
+/// heap) instead of repeating kernel walks every submission. Range-granularly
+/// invalidated by [`invalidate_mapped_range`] whenever title memory is
+/// unmapped, freed, or remapped.
+#[derive(Default)]
+struct MappedCache {
+    /// Sorted, non-overlapping verified committed readable regions `(start, end)`.
+    regions: Vec<(usize, usize)>,
+    /// Verified individual pages (fallback when a region is guarded or mixed).
+    pages: HashMap<usize, ()>,
+}
+
+impl MappedCache {
+    /// Returns the end of the cached region covering `addr`, if any.
+    #[inline]
+    fn find_end(&self, addr: usize) -> Option<usize> {
+        let idx = self.regions.partition_point(|&(lo, _)| lo <= addr);
+        if idx == 0 {
+            return None;
         }
-    })
+        let (_, hi) = self.regions[idx - 1];
+        (addr < hi).then_some(hi)
+    }
+
+    #[inline]
+    fn covers(&self, from: usize, to: usize) -> bool {
+        self.find_end(from).is_some_and(|hi| to <= hi)
+    }
+
+    fn insert_region(&mut self, lo: usize, hi: usize) {
+        if lo >= hi {
+            return;
+        }
+        const MAX_REGIONS: usize = 512;
+        if self.regions.len() >= MAX_REGIONS {
+            self.regions.clear();
+        }
+        let mut idx = self.regions.partition_point(|&(r_lo, _)| r_lo < lo);
+        let mut new_lo = lo;
+        let mut new_hi = hi;
+        if idx > 0 && self.regions[idx - 1].1 >= new_lo {
+            idx -= 1;
+            new_lo = new_lo.min(self.regions[idx].0);
+            new_hi = new_hi.max(self.regions[idx].1);
+        }
+        let mut end = idx;
+        while end < self.regions.len() && self.regions[end].0 <= new_hi {
+            new_hi = new_hi.max(self.regions[end].1);
+            end += 1;
+        }
+        self.regions.splice(idx..end, std::iter::once((new_lo, new_hi)));
+    }
+
+    /// Removes only `[at, at + len)` from cached readable regions and pages.
+    /// When `len == 0` (whole-allocation free), removes any region containing `at`
+    /// and clears fallback pages.
+    fn invalidate_range(&mut self, at: usize, len: usize) {
+        if len == 0 {
+            if at == 0 {
+                self.regions.clear();
+                self.pages.clear();
+                return;
+            }
+            let idx = self.regions.partition_point(|&(lo, _)| lo <= at);
+            if idx > 0 && self.regions[idx - 1].1 > at {
+                self.regions.remove(idx - 1);
+            }
+            self.pages.clear();
+            return;
+        }
+        let u_lo = at;
+        let u_hi = at.saturating_add(len);
+        if !self.regions.is_empty() {
+            let mut idx = self.regions.partition_point(|&(lo, _)| lo < u_lo);
+            if idx > 0 && self.regions[idx - 1].1 > u_lo {
+                idx -= 1;
+            }
+            let mut end = idx;
+            while end < self.regions.len() && self.regions[end].0 < u_hi {
+                end += 1;
+            }
+            if idx < end {
+                let first_lo = self.regions[idx].0;
+                let last_hi = self.regions[end - 1].1;
+                let mut replacement = [None, None];
+                let mut n = 0;
+                if first_lo < u_lo {
+                    replacement[n] = Some((first_lo, u_lo));
+                    n += 1;
+                }
+                if last_hi > u_hi {
+                    replacement[n] = Some((u_hi, last_hi));
+                    n += 1;
+                }
+                self.regions.splice(idx..end, replacement[..n].iter().flatten().copied());
+            }
+        }
+        if !self.pages.is_empty() {
+            let first_p = u_lo / 4096;
+            let last_p = u_hi.div_ceil(4096);
+            self.pages.retain(|&p, _| p < first_p || p >= last_p);
+        }
+    }
+}
+
+/// Fast atomic flag so `invalidate_mapped_range` skips locking before first use.
+static MAPPED_HAS_DATA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Persistent readable-span cache shared across submissions (locked once per
+/// `take_steps` call under the submission lock).
+static PERSISTENT_MAPPED: Mutex<MappedCache> = Mutex::new(MappedCache {
+    regions: Vec::new(),
+    pages: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+});
+
+/// Evicts `[at, at + len)` (or the allocation containing `at` when `len == 0`)
+/// from the cross-submission `VirtualQuery` readable-span cache.
+pub(crate) fn invalidate_mapped_range(at: usize, len: usize) {
+    if !MAPPED_HAS_DATA.load(Ordering::Acquire) {
+        return;
+    }
+    let mut cache = PERSISTENT_MAPPED.lock().unwrap_or_else(|e| e.into_inner());
+    cache.invalidate_range(at, len);
+    if cache.regions.is_empty() && cache.pages.is_empty() {
+        MAPPED_HAS_DATA.store(false, Ordering::Release);
+    }
+}
+
+/// Whether every page of `[from, to)` can be read.
+fn mapped(from: usize, to: usize, cache: &mut MappedCache) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+        PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
+        VirtualQuery,
+    };
+    const PAGE: usize = 4096;
+    const READABLE: u32 = PAGE_READONLY
+        | PAGE_READWRITE
+        | PAGE_WRITECOPY
+        | PAGE_EXECUTE_READ
+        | PAGE_EXECUTE_READWRITE
+        | PAGE_EXECUTE_WRITECOPY;
+    if cache.covers(from, to) {
+        return true;
+    }
+    let mut cur = from;
+    while cur < to {
+        if let Some(hi) = cache.find_end(cur) {
+            cur = hi;
+            continue;
+        }
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let ok = unsafe {
+            VirtualQuery(
+                cur as *const core::ffi::c_void,
+                &mut mbi,
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        } != 0;
+        if ok && mbi.State == MEM_COMMIT && (mbi.Protect & PAGE_GUARD) == 0 && (mbi.Protect & READABLE) != 0 {
+            let r_lo = mbi.BaseAddress as usize;
+            let r_hi = r_lo.saturating_add(mbi.RegionSize);
+            if r_hi > cur {
+                cache.insert_region(r_lo, r_hi);
+                MAPPED_HAS_DATA.store(true, Ordering::Release);
+                cur = r_hi;
+                continue;
+            }
+        }
+        // Fallback: probe page-by-page via `read_into` (handles guarded pages).
+        let page = cur / PAGE;
+        if !cache.pages.contains_key(&page) {
+            if !read_into(cur as *const u8, &mut [0]) {
+                return false;
+            }
+            if cache.pages.len() >= 4096 {
+                cache.pages.clear();
+            }
+            cache.pages.insert(page, ());
+            MAPPED_HAS_DATA.store(true, Ordering::Release);
+        }
+        cur = (page + 1) * PAGE;
+    }
+    true
 }
 
 /// A table by addresses and numbers of ours.
@@ -717,7 +887,7 @@ impl Host {
         // Some 2,800 fills a frame, of a few hundred places: what holds each
         // is looked for once, as long as no copy is added to the writers.
         let mut held: HashMap<(usize, usize), Arc<Shadow>> = HashMap::default();
-        let mut room = HashMap::default();
+        let mut room = PERSISTENT_MAPPED.lock().unwrap_or_else(|e| e.into_inner());
         let mut end = 0u64;
         for &(i, level) in &chosen {
             let Some(((src, _), (dst, _))) = reads_writes(&does[i]) else {
@@ -1337,5 +1507,36 @@ mod tests {
         eprintln!("{done} of 48 copies were done on the card, {} submissions waited", DONE[3].load(Ordering::Relaxed));
         eprintln!("settles for title memory under shader writes: {}", LATE_STATS[WHY_STALE].load(Ordering::Relaxed));
         assert!(done >= 20, "only {done} copies were done on the card");
+    }
+
+    #[test]
+    fn mapped_cache_merges_and_invalidates() {
+        let mut cache = MappedCache::default();
+        cache.insert_region(0x10000, 0x20000);
+        cache.insert_region(0x30000, 0x40000);
+        cache.insert_region(0x20000, 0x30000); // bridges both spans
+        assert_eq!(cache.regions, vec![(0x10000, 0x40000)]);
+        assert!(cache.covers(0x12000, 0x3F000));
+        assert!(!cache.covers(0x0F000, 0x20000));
+        assert!(!cache.covers(0x30000, 0x41000));
+        assert_eq!(cache.find_end(0x15000), Some(0x40000));
+        assert_eq!(cache.find_end(0x40000), None);
+
+        // Unrelated texture remap outside cached buffer heap leaves cache intact.
+        cache.invalidate_range(0x80000, 0x20000);
+        assert_eq!(cache.regions, vec![(0x10000, 0x40000)]);
+
+        // Punching a hole splits the span cleanly.
+        cache.invalidate_range(0x20000, 0x10000);
+        assert_eq!(cache.regions, vec![(0x10000, 0x20000), (0x30000, 0x40000)]);
+        assert!(cache.covers(0x10000, 0x20000));
+        assert!(!cache.covers(0x20000, 0x21000));
+        assert!(cache.covers(0x30000, 0x40000));
+
+        // Whole-allocation free (`len == 0`) drops only the containing span.
+        cache.pages.insert(0x123, ());
+        cache.invalidate_range(0x15000, 0);
+        assert_eq!(cache.regions, vec![(0x30000, 0x40000)]);
+        assert!(cache.pages.is_empty());
     }
 }

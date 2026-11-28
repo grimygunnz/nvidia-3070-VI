@@ -535,8 +535,10 @@ pub(crate) unsafe fn texture(
             crate::residency::allocation_error(&e);
             tracing::warn!(error = %e, "no block of texture memory");
         }
+        // Queued for MakeResident; [`crate::host::mapped`] before the next
+        // submission flushes the batch and waits once for the card's mapping.
         if let Some(h) = &heap
-            && let Err(e) = crate::host::resident(device, h).and_then(|()| crate::host::mapped(device))
+            && let Err(e) = crate::host::resident(device, h)
         {
             tracing::warn!(error = %e, "a block of texture memory is not resident");
             return None;

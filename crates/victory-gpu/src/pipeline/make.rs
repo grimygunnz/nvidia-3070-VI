@@ -49,6 +49,8 @@ pub(crate) struct Pending {
     scene_input: bool,
     /// Why this pipeline is intentionally skipped (e.g. RT resolve without BVH).
     left_out: Option<&'static str>,
+    /// Micros waited for this pipeline across frames ([`wait_once`]).
+    waited_us: AtomicU64,
 }
 
 fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
@@ -57,7 +59,25 @@ fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
         .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
 }
 
+/// Shader hashes whose pipelines are left out in every build
+/// (`VICTORY_LEAVE_OUT=<16 hex digits>[,..]`; NVIDIA foxhound: heat-haze /
+/// decal-heap defrag that spun ~12 ms of GPU a frame in the first area).
+fn leave_out() -> &'static [String] {
+    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    HASHES.get_or_init(|| {
+        std::env::var("VICTORY_LEAVE_OUT")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+            .collect()
+    })
+}
+
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+    if !leave_out().is_empty() && shaders.iter().any(|s| leave_out().contains(&s.hash)) {
+        return Some("named in VICTORY_LEAVE_OUT, left out");
+    }
     static SKIP_RT_RESOLVE: OnceLock<bool> = OnceLock::new();
     let skip_rt = *SKIP_RT_RESOLVE.get_or_init(|| {
         let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
@@ -131,6 +151,7 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            waited_us: AtomicU64::new(0),
         }
     }
 
@@ -262,16 +283,109 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
     p.made.get().is_some_and(|made| made.is_some())
 }
 
+/// Whether splash/load pipeline preload is on (`VICTORY_PIPELINE_SPLASH=1`).
+/// While draws stay under 500/frame (boot logo / loading), presents wait for
+/// early workers to drain so the cutscene does not hitch on cold compiles.
+fn splash_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_PIPELINE_SPLASH").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!(
+                ms = splash_budget_ms(),
+                "pipeline splash preload: drain early queue on load presents (VICTORY_PIPELINE_SPLASH=1)"
+            );
+        }
+        on
+    })
+}
+
+/// Max ms to wait for the early queue per splash present (`VICTORY_PIPELINE_SPLASH_MS`, 750).
+fn splash_budget_ms() -> u64 {
+    static MS: OnceLock<u64> = OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("VICTORY_PIPELINE_SPLASH_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(750)
+    })
+}
+
+/// Still on the splash / load path (world not yet past 500 draws/frame).
+fn splash_active() -> bool {
+    splash_on() && !crate::resource::world_started()
+}
+
+/// At each splash present: wait for early pipeline workers to finish what
+/// was queued during load (up to [`splash_budget_ms`] per present).
+pub(crate) fn splash_drain(frame: u64, draws_this: u64) {
+    if !splash_active() {
+        return;
+    }
+    let budget_ms = splash_budget_ms();
+    if budget_ms == 0 {
+        return;
+    }
+    let waiting = WAITING.load(Ordering::Relaxed);
+    if waiting == 0 {
+        return;
+    }
+    let budget = Duration::from_millis(budget_ms);
+    let started = Instant::now();
+    let (lock, done) = &DONE;
+    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while WAITING.load(Ordering::Relaxed) > 0 {
+        let rest = budget.saturating_sub(started.elapsed());
+        if rest.is_zero() {
+            break;
+        }
+        held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
+    }
+    drop(held);
+    let left = WAITING.load(Ordering::Relaxed);
+    let waited_ms = started.elapsed().as_millis() as u64;
+    // At most one line a second, or whenever the queue empties.
+    static LAST_LOG_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now_ms = crate::host::now_ms();
+    let due = left == 0 || now_ms.saturating_sub(LAST_LOG_MS.load(Ordering::Relaxed)) >= 1000;
+    if due && (left == 0 || waited_ms > 0) {
+        LAST_LOG_MS.store(now_ms, Ordering::Relaxed);
+        tracing::info!(
+            frame,
+            draws = draws_this,
+            waited_ms,
+            still_waiting = left,
+            "pipeline splash drain (VICTORY_PIPELINE_SPLASH)"
+        );
+    }
+}
+
+/// World has begun: stop splash drain waits (workers keep going in the background).
+pub(crate) fn splash_ended(frame: u64) {
+    if !splash_on() {
+        return;
+    }
+    tracing::info!(
+        frame,
+        still_waiting = WAITING.load(Ordering::Relaxed),
+        "pipeline splash preload ended (world frame); remaining compiles stay in the background"
+    );
+}
+
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it),
 /// or if it is a confirmed opening-scene / bake producer.
+///
+/// With splash preload, early list entries are queued as requested (ahead of
+/// cold RT) so the drain clears the cutscene set first.
 pub(crate) fn early(p: &Arc<Pending>) {
     if p.left_out.is_some() {
         return;
     }
     if !p.shaders.is_empty() && (p.scene_input || super::library::wanted_early(&p.key)) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
-        start(p, if p.scene_input { REQUESTED } else { EARLY });
+        let priority = if p.scene_input || splash_active() { REQUESTED } else { EARLY };
+        start(p, priority);
     }
 }
 
@@ -288,13 +402,53 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
+/// Cap waits per pipeline lifetime, not every frame: a slow compile otherwise
+/// took the whole budget in every frame while it was in view (`VICTORY_PIPELINE_WAIT_ONCE`,
+/// on by default; `0` waits as before). Ported from ProjectLeonida/mandy (fxceless #1181).
+fn wait_once() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_ONCE").is_none_or(|v| v != "0"))
+}
+
+/// Per-frame wait cap once world startup has completed
+/// (`VICTORY_COMPUTE_LATE_WAIT_MS`, default 400 ms; 0 = use full budget).
+/// Startup frames (`frame < 180`) and screen passes keep the full budget.
+/// Ported from RAZDA4A-XEN (list-pool / freeze work).
+fn late_budget() -> Duration {
+    static BUDGET: OnceLock<Duration> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let millis = std::env::var("VICTORY_COMPUTE_LATE_WAIT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(400);
+        Duration::from_millis(millis)
+    })
+}
+
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
     let screen = p.screen && screens_first();
-    let budget = if screen { screen_budget() } else { wait_budget() };
+    let mut budget = if screen { screen_budget() } else { wait_budget() };
+    // Splash/load: keep the full wait budget so early pipelines finish before
+    // the cutscene; late-budget only applies once the world has started.
+    if !screen && frame >= 180 && !splash_active() {
+        let late = late_budget();
+        if !late.is_zero() {
+            budget = budget.min(late);
+        }
+    }
     if budget.is_zero() {
         return;
     }
+    let own = if wait_once() {
+        let own = budget.saturating_sub(Duration::from_micros(p.waited_us.load(Ordering::Relaxed)));
+        if own.is_zero() {
+            return;
+        }
+        own
+    } else {
+        Duration::MAX
+    };
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now); of the passes over the screen too.
     static SPENT: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
@@ -305,7 +459,7 @@ fn wait(p: &Pending, frame: u64) {
         if spent.0 != frame {
             *spent = (frame, Duration::ZERO);
         }
-        let left = budget.saturating_sub(spent.1);
+        let left = budget.saturating_sub(spent.1).min(own);
         if shared {
             spent.1 += left;
         }
@@ -326,6 +480,16 @@ fn wait(p: &Pending, frame: u64) {
     }
     drop(held);
     let waited = started.elapsed().min(left);
+    if wait_once() && p.made.get().is_none() {
+        let before = p.waited_us.fetch_add(waited.as_micros() as u64, Ordering::Relaxed);
+        if Duration::from_micros(before) + waited >= budget {
+            tracing::info!(
+                shaders = ?p.shaders,
+                ms = budget.as_millis() as u64,
+                "a pipeline not made within its wait: its draws are dropped until it is (VICTORY_PIPELINE_WAIT_ONCE=0: waited for every frame)"
+            );
+        }
+    }
     if screen && waited > Duration::from_millis(500) {
         tracing::info!(
             ms = waited.as_millis() as u64,
@@ -521,7 +685,11 @@ fn workers() -> bool {
                     // Below the title's own threads (loading, recording),
                     // and the streaming one, which is below normal itself
                     // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before).
-                    let lowest = !screens_only && std::env::var_os("VICTORY_PIPELINE_LOWEST").is_none_or(|v| v != "0");
+                    // Splash preload: keep workers a step above lowest so load
+                    // presents drain faster; still below the title's threads.
+                    let lowest = !screens_only
+                        && !splash_on()
+                        && std::env::var_os("VICTORY_PIPELINE_LOWEST").is_none_or(|v| v != "0");
                     // SAFETY: a plain call on our own thread.
                     unsafe {
                         use windows::Win32::System::Threading::*;

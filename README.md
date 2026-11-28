@@ -10,25 +10,28 @@ RTX 3070 Ti, a Ryzen 9 5900X and 64 GB of RAM.
 **This repository contains no game files, code or assets.** You need your own copy of
 the game. It is not affiliated with or endorsed by the game's developer or publisher.
 
-## Where it stands (2026-11-26)
+## Where it stands (2026-11-27)
 
-Gameplay of the opening (the prologue), Series S profile, mean of every frame from
-200 s to 330 s into a run:
+Gameplay of the opening (the prologue), Series S profile (`-Profile br`), late frames
+of an unattended run (`-SkipMenus -Seconds 260`, mean of the last 15 frame lines):
 
-| Build | Mean frame | fps | CPU preparing | Waiting for the card |
-|---|---|---|---|---|
-| cool_fox as published | 327 ms | 3.1 | 69 ms | 245 ms |
-| **This fork** | **61 ms** | **16.3** | **50 ms** | **0.3 ms** |
+| Build | Mean frame | fps | CPU preparing |
+|---|---|---|---|
+| cool_fox as published (2026-11-26) | 327 ms | 3.1 | 69 ms |
+| This fork, card-buffer floor (2026-11-26) | 61 ms | 16.3 | 50 ms |
+| **This fork (br, bus + prepare)** | **41 ms** | **24.3** | **31 ms** |
 
-The Series X profile runs at 123 ms (8.1 fps): its render targets push the card's
-memory to 8.5 GB of a 6.8 GB budget, and Windows moves resources out to system memory.
-Use the Series S profile on 8 GB cards (the launchers do).
+Still short of 30 fps. The remaining prepare wall is mostly real title→copy refreshes
+(~11 ms / ~23 MB read a frame) and write-watch asking (~4 ms). `VICTORY_PAGE_TABLE`
+stays off here.
+
+The Series X profile still does not fit 8 GB: use Series S (the launchers do).
 
 What is known to be wrong (most of it upstream's, see [the bug journal](docs/bug-journal.md)):
 
 - Shadowed and indoor areas are too dark: the title's ray-traced light does not run.
-- About 350 draws a frame are dropped, mostly shaders the translator cannot build yet.
-- Textures stream in late and some look blocky: the card is full, and some 24,000 wait.
+- About 250–350 draws a frame are dropped, mostly shaders the translator cannot build yet.
+- Textures stream in late and some look blocky: the card is full, and some wait.
 - The first run with a new driver or build stutters while pipelines are compiled.
 
 ## What is different here
@@ -36,22 +39,29 @@ What is known to be wrong (most of it upstream's, see [the bug journal](docs/bug
 The reasons and every measurement are in [docs/nvidia-8gb.md](docs/nvidia-8gb.md).
 
 - **Title buffers stay in the card's memory** on cards with a budget of 12 GB or less:
-  up to 2,048 MB of their copies, where upstream kept 512 MB for that class of card. With
-  512 MB, 1,198 copies fit and thousands more were read by the card over PCIe from
-  system memory: 245 ms a frame of waiting. This one change is the 327 → 61 ms.
-  `VICTORY_CARD_BUFFERS_MB` still sets the limit.
-- **Every card copy has 64 KiB past its end** (`VICTORY_CARD_PAD_KB`). With every buffer
-  in its own allocation on the card, a shader reading past a buffer's end hit an unmapped
-  address and the device was lost (the driver logged MMU faults). In system memory the
-  same read had landed in the next allocation.
-- **A sampling profiler** (`VICTORY_PROFILE=1`, diagnostics builds): per thread and per
-  function, ms a frame, with the waits named. It is how the cause above was found.
-- **A stress test of the write tracking** (`cargo test -p victory-gpu watch::stress`):
-  title threads write values that only grow into watched and guarded memory while
-  submissions refresh overlapping copies on several threads, and no write made before a
-  submission may be missing from its copy. 3.8 million checks in 20,000 submissions.
-- **A guarded launcher** (`scripts/play-guarded.ps1`) that caps the game's committed
-  memory and ends it before the PC runs out, with a memory log every 5 s.
+  up to 2,048 MB of their copies (the 327 → 61 ms step). `VICTORY_CARD_BUFFERS_MB`
+  still sets the limit; every copy has 64 KiB past its end (`VICTORY_CARD_PAD_KB`).
+- **Discrete / non-unified bus**: placed title copies skip PCIe land waits when the
+  title wrote the page (`VICTORY_PLACED_TITLE`); ReBAR / `WINDOWS_BAR` keeps shader
+  window reads in card memory when the bar is large enough; large high-heap
+  fetch-only copies stay on the card (`VICTORY_HIGH_NO_BACK=1` in the `br` profile)
+  so ~21 MB/frame of fetch-only traffic is not pulled back.
+- **Prepare CPU**: empty-refresh looks are batched (`VICTORY_LOOKS_APART`, on with
+  light refresh); a title write flushes only pending refreshes that overlap that
+  range (`title_written_at`, `VICTORY_WRITE_FLUSH=all` restores the old full flush);
+  heap-record sync is kicked before flight settle so its work overlaps that wait.
+  Differing bytes only go up (`VICTORY_COPY_CHANGED`), quiet 1 MiB blocks are asked
+  once a frame (`VICTORY_ASK_QUIET`), and copy-back pages stay quiet
+  (`VICTORY_QUIET_BACK`).
+- **Residency batched** before each submit (was ~11 ms/frame of `MakeResident` waits).
+- **On-picture panel** (`VICTORY_PANEL=1`, F3): RAM / VRAM / commit, resolution, RT,
+  lighting, shaders and textures.
+- **A sampling profiler** (`VICTORY_PROFILE=1`, diagnostics builds) and a write-watch
+  stress test (`cargo test -p victory-gpu watch::stress`).
+- **A guarded launcher** (`scripts/play-guarded.ps1`) that caps committed memory and
+  ends the game before the PC runs out. `-Profile br` is the measured Series S path
+  above; `VICTORY_PAGE_TABLE` and `VICTORY_TEARING` stay off / opt-in (tearing smeared
+  here).
 
 ## How to run it
 
@@ -76,7 +86,7 @@ target\diag\victory.exe shaders <your dump>\shaders.rpf <your dump>\game_scarlet
 Then play:
 
 ```powershell
-scripts\play-guarded.ps1 -Game <your dump>\game_scarlett_master.exe
+scripts\play-guarded.ps1 -Game <your dump>\game_scarlett_master.exe -Profile br
 ```
 
 `-Console series-x` picks the other profile, `-MaxGB` and `-MinFreeGB` set the memory
@@ -106,7 +116,8 @@ commits taken from elsewhere name the commit and its author.
 - **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)** and the people
   whose pull requests it carries, and everyone named in
   [docs/README-cool_fox.md](docs/README-cool_fox.md).
-- This fork's changes were made with [Claude Code](https://claude.com/claude-code).
+- This fork's changes were made with [Claude Code](https://claude.com/claude-code)
+  and [Cursor](https://cursor.com).
 
 ## License
 

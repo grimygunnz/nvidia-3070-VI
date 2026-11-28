@@ -184,15 +184,16 @@ fn sync_aside() -> bool {
 }
 
 /// How long that thread waits for a submission before it makes a round of its
-/// own (`VICTORY_HEAP_SYNC_EARLY=<ms>`, 4 if not given; `0`: none). The title
+/// own (`VICTORY_HEAP_SYNC_EARLY=<ms>`, 1 if not given; `0`: none). The title
 /// copies its records while it records, and the first submission of a frame
 /// found all of them: 8 ms waited for (run cpu-2). A round made meanwhile
-/// leaves it those written since.
+/// leaves it those written since. Default was 4; at ~44 ms frames the submit
+/// still waits ~3-4 ms at the end for records, so rounds start sooner.
 #[cfg(windows)]
 fn sync_early() -> Option<std::time::Duration> {
     static EVERY: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
     *EVERY.get_or_init(|| {
-        let ms = std::env::var("VICTORY_HEAP_SYNC_EARLY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4u64);
+        let ms = std::env::var("VICTORY_HEAP_SYNC_EARLY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1u64);
         (ms > 0).then(|| std::time::Duration::from_millis(ms))
     })
 }
@@ -217,6 +218,8 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
     STARTED.call_once(|| {
         let made = std::thread::Builder::new().name("victory-heap-sync".into()).spawn(|| {
             crate::cores::keep_on_fast_cores("victory-heap-sync");
+            // (The submitting thread waits for its rounds.)
+            let mut priority = crate::cores::Priority::new();
             let rounds = || SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
             /// A round is over, however it ends.
             struct Over;
@@ -245,6 +248,7 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
                     }
                 }
                 drop(r);
+                priority.keep();
                 let _over = asked.then(|| {
                     last = std::time::Instant::now();
                     Over
@@ -497,7 +501,9 @@ struct SyncPart {
 
 /// Pages [`sync_heaps`] gives a thread at a time.
 #[cfg(windows)]
-const SYNC_PAGES: usize = 8;
+/// Pages a heap-sync helper takes at a time. Was 8 (~16 jobs for ~122 pages);
+/// 32 cuts land::each_view overhead on the ~3 ms read/compare phase.
+const SYNC_PAGES: usize = 32;
 
 /// Records [`sync_heaps`] gives a thread at a time.
 #[cfg(windows)]

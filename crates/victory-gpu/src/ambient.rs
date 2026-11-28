@@ -87,7 +87,12 @@ fn parse(set: &str) -> Set {
     let set = set.trim();
     let number = |t: &str| t.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0);
     match set.strip_prefix("constant:") {
-        Some(level) => number(level).map_or(Set::Off, Set::Constant),
+        // `constant:<level>` or `constant:<level>:<share>` (VI-BR-PORT); share is
+        // ignored until AMBIENT_OUTSIDE lands — the level still applies indoors.
+        Some(rest) => {
+            let level = rest.split(':').next().unwrap_or(rest);
+            number(level).map_or(Set::Off, Set::Constant)
+        }
         None => number(set).map_or(Set::Off, Set::Estimate),
     }
 }
